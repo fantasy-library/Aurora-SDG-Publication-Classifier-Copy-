@@ -1,0 +1,1985 @@
+import csv
+import inspect
+import io
+import math
+import os
+import re
+import itertools
+import json
+import networkx as nx
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from xml.sax.saxutils import escape
+from zipfile import ZipFile, ZIP_DEFLATED
+
+import altair as alt
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+import tomllib
+
+from openalex_sdg import (
+    AURORA_MODELS,
+    DEFAULT_USER_AGENT,
+    FetchCancelled,
+    FetchStats,
+    fetch_institution_lineage,
+    fetch_works_with_sdg,
+    is_ror_url,
+    is_openalex_institution_id,
+    looks_like_scopus_author_id,
+    resolve_author_openalex_id,
+    sanitize_filename,
+    search_institutions_by_name,
+)
+
+
+def _call_fetch_works_with_sdg(
+    from_date: str,
+    work_type: Optional[str],
+    model: str,
+    **kwargs: Any,
+) -> Tuple[List[Dict[str, Any]], FetchStats]:
+    """Call ``fetch_works_with_sdg`` with only kwargs the loaded ``openalex_sdg`` defines."""
+    valid = set(inspect.signature(fetch_works_with_sdg).parameters)
+    return fetch_works_with_sdg(
+        from_date, work_type, model, **{k: v for k, v in kwargs.items() if k in valid}
+    )
+
+
+SECRET_HTTP_USER_AGENT = "http_user_agent"
+SECRET_SCOPUS_API_KEY = "scopus_api_key"
+SECRET_SCOPUS_INSTTOKEN = "scopus_insttoken"
+SECRET_GOOGLE_SCHOLAR_ENABLED = "google_scholar_enabled"
+SECRET_DEFAULT_START = "advanced_options.default_from_date"
+SECRET_SERPAPI_KEY = "serpapi_api_key" # New constant for SerpApi Key
+_SECRETS: Dict[str, Any] = {}
+
+
+def _load_dotenv_file() -> None:
+    """
+    Load ``.env`` into the process environment (does not replace existing vars).
+
+    Tries ``.env`` next to ``app.py`` first, then the current working directory.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    repo_root = Path(__file__).resolve().parent
+    load_dotenv(repo_root / ".env")
+    load_dotenv(Path.cwd() / ".env")
+
+
+def _merge_env_into_secrets(target: Dict[str, Any]) -> None:
+    """Copy configured API keys from the environment into ``target``."""
+    mappings = (
+        ("HTTP_USER_AGENT", SECRET_HTTP_USER_AGENT),
+        ("SCOPUS_API_KEY", SECRET_SCOPUS_API_KEY),
+        ("SCOPUS_INSTTOKEN", SECRET_SCOPUS_INSTTOKEN),
+        ("SERPAPI_API_KEY", SECRET_SERPAPI_KEY),
+        ("GOOGLE_SCHOLAR_ENABLED", SECRET_GOOGLE_SCHOLAR_ENABLED),
+    )
+    for env_name, secret_key in mappings:
+        raw = os.environ.get(env_name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        target[secret_key] = raw.strip()
+
+    dfd = os.environ.get("DEFAULT_FROM_DATE") or os.environ.get(
+        "ADVANCED_OPTIONS_DEFAULT_FROM_DATE"
+    )
+    if dfd and str(dfd).strip():
+        adv = target.setdefault("advanced_options", {})
+        if isinstance(adv, dict):
+            adv["default_from_date"] = str(dfd).strip()
+
+
+PREVIEW_COLUMNS = [
+    "openalex_id",
+    "authors",
+    "title",
+    "publication_date",
+    "type",
+    "doi",
+    "institutions",
+]
+PREVIEW_PAGE_SIZE = 25
+CSV_FIELDNAMES = [
+    "openalex_id",
+    "authors",
+    "title",
+    "publication_date",
+    "doi",
+    "type",
+    "language",
+    "is_oa",
+    "oa_status",
+    "institutions",
+    "institution_ids",
+    "institution_countries",
+    "institution_names_raw",
+    "abstract",
+    "sdg_model",
+    "sdg_response",
+    "sdg_formatted",
+    "sdg_note",
+]
+RESULT_SESSION_KEY = "fetch_result"
+# Radio option labels (avoid format_func — incompatible with some Streamlit / widget-state combos).
+QUERY_TARGET_LABEL_INSTITUTION = "Institution (ROR / OpenAlex)"
+QUERY_TARGET_LABEL_AUTHOR = "Author (ORCID / OpenAlex / Scopus)"
+SDG_THRESHOLD_PERCENT = 3.0
+OA_STATUS_ORDER = ["diamond", "gold", "hybrid", "green", "bronze", "closed"]
+OA_STATUS_COLORS = {
+    "diamond": "#7dd3fc",
+    "gold": "#facc15",
+    "hybrid": "#efa046",
+    "green": "#22c55e",
+    "bronze": "#cd7f32",
+    "closed": "#6b7280",
+}
+SDG_COLORS = {
+    "1": "#e5243b",   # No Poverty
+    "2": "#dda63a",   # Zero Hunger
+    "3": "#4c9f38",   # Good Health and Well-being
+    "4": "#c5192d",   # Quality Education
+    "5": "#ff3a21",   # Gender Equality
+    "6": "#26bde2",   # Clean Water and Sanitation
+    "7": "#fcc30b",   # Affordable and Clean Energy
+    "8": "#a21942",   # Decent Work and Economic Growth
+    "9": "#fd6925",   # Industry, Innovation and Infrastructure
+    "10": "#dd1367",  # Reduced Inequalities
+    "11": "#fd9d24",  # Sustainable Cities and Communities
+    "12": "#bf8b2e",  # Responsible Consumption and Production
+    "13": "#3f7e44",  # Climate Action
+    "14": "#0a97d9",  # Life Below Water
+    "15": "#56c02b",  # Life on Land
+    "16": "#00689d",  # Peace, Justice and Strong Institutions
+    "17": "#19486a",  # Partnerships for the Goals
+}
+RADIO_CHECKBOX_CSS = """
+<style>
+div[data-testid="stDataFrame"] div[role="checkbox"] input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 1rem;
+    height: 1rem;
+    border: 2px solid var(--primary-color);
+    border-radius: 50%;
+    position: relative;
+    cursor: pointer;
+}
+div[data-testid="stDataFrame"] div[role="checkbox"] input[type="checkbox"]:checked {
+    background-color: var(--primary-color);
+}
+div[data-testid="stDataFrame"] div[role="checkbox"] input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    top: 0.15rem;
+    left: 0.15rem;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background-color: white;
+}
+</style>
+"""
+
+
+def _load_secrets() -> Dict[str, Any]:
+    """
+    Load secrets once per process.
+
+    Primary source: Streamlit ``st.secrets`` (``.streamlit/secrets.toml``), or a direct TOML
+    read if secrets are unavailable. Optional: mapped keys from ``.env`` / the process
+    environment are merged last and **override** TOML for those keys only (see ``.env.example``).
+    """
+    if _SECRETS:
+        return _SECRETS
+    _load_dotenv_file()
+    try:
+        for key, value in st.secrets.items():
+            _SECRETS[key] = value
+    except Exception:
+        pass
+    if not _SECRETS:
+        candidate_paths = [
+            Path(".streamlit/secrets.toml"),
+            Path.home() / ".streamlit" / "secrets.toml",
+        ]
+        for path in candidate_paths:
+            if not path.is_file():
+                continue
+            try:
+                with path.open("rb") as fh:
+                    data = tomllib.load(fh)
+                    if isinstance(data, dict):
+                        _SECRETS.update(data)
+            except Exception:
+                continue
+    _merge_env_into_secrets(_SECRETS)
+    return _SECRETS
+
+
+def get_secret_text(name: str) -> Optional[str]:
+    """Return a string secret (supports dotted section.key names)."""
+    if "." in name:
+        section, key = name.split(".", 1)
+        raw_value = (_load_secrets().get(section) or {}).get(key)
+    else:
+        raw_value = _load_secrets().get(name)
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return text
+
+
+def get_secret_bool(name: str) -> Optional[bool]:
+    """Interpret a secret value as a boolean if possible."""
+    text = get_secret_text(name)
+    if text is None:
+        return None
+    value = text.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def resolve_user_agent() -> Tuple[str, bool]:
+    """Return the HTTP user agent and flag whether it came from secrets."""
+    secret_value = get_secret_text(SECRET_HTTP_USER_AGENT)
+    if secret_value:
+        return secret_value.strip(), True
+    return DEFAULT_USER_AGENT, False
+
+
+def resolve_scopus_api_key() -> Optional[str]:
+    """Elsevier API key for Scopus abstract retrieval (optional)."""
+    return get_secret_text(SECRET_SCOPUS_API_KEY)
+
+
+def resolve_scopus_insttoken() -> Optional[str]:
+    """Institutional token for Elsevier Abstract API (required together with scopus_api_key)."""
+    return get_secret_text(SECRET_SCOPUS_INSTTOKEN)
+
+
+def resolve_google_scholar_enabled() -> bool:
+    """Decide whether Google Scholar lookups are allowed."""
+    value = get_secret_bool(SECRET_GOOGLE_SCHOLAR_ENABLED)
+    if value is None:
+        return False
+    return value
+
+def resolve_serpapi_key() -> Optional[str]:
+    """Read the SerpApi API key (if supplied)."""
+    return get_secret_text(SECRET_SERPAPI_KEY)
+
+
+def build_preview_rows(
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+    limit: int = 20,
+    offset: int = 0,
+) -> List[Dict[str, str]]:
+    """Create a lightweight list of dictionaries for the preview table."""
+    preview: List[Dict[str, str]] = []
+    subset = rows[offset : offset + max(limit, 0)]
+    for row in subset:
+        preview.append({col: str(row.get(col, "") or "") for col in columns})
+    return preview
+
+
+def abbreviate_authors(value: str) -> str:
+    """Return 'First Author et al.' style preview for long author lists."""
+    if not value:
+        return ""
+    authors = [part.strip() for part in value.split(";") if part.strip()]
+    if not authors:
+        return ""
+    if len(authors) == 1:
+        return authors[0]
+    return f"{authors[0]} et al."
+
+
+def parse_sdg_formatted(value: str) -> List[Tuple[str, float, str]]:
+    """Parse the stored SDG formatted string into tuples."""
+    entries: List[Tuple[str, float, str]] = []
+    if not value:
+        return entries
+    for line in value.splitlines():
+        match = re.search(r"(\d+(?:\.\d+)?)%\s*(?:SDG\s*)?(\d+)(?:\s*\(([^)]+)\))?", line, re.I)
+        if not match:
+            continue
+        pct = float(match.group(1))
+        code = match.group(2)
+        name = match.group(3) or ""
+        entries.append((code, pct, name))
+    return entries
+
+
+def aggregate_sdg_counts(rows: List[Dict[str, Any]]) -> List[Tuple[str, str, float]]:
+    """Combine SDG percentages across all rows, normalize to 100%, keep codes for coloring."""
+    totals: Dict[str, float] = {}
+    labels: Dict[str, str] = {}
+    for row in rows:
+        formatted = row.get("sdg_formatted") or ""
+        for code, pct, name in parse_sdg_formatted(formatted):
+            if pct < SDG_THRESHOLD_PERCENT:
+                continue
+            label = f"SDG {code}"
+            if name:
+                label = f"{label} ({name})"
+            labels.setdefault(code, label)
+            totals[code] = totals.get(code, 0.0) + pct
+    sorted_totals = sorted(totals.items(), key=lambda pair: pair[1], reverse=True)
+    total_pct = sum(value for _, value in sorted_totals)
+    if total_pct <= 0:
+        return []
+    return [
+        (code, labels.get(code, f"SDG {code}"), (value / total_pct) * 100.0)
+        for code, value in sorted_totals
+    ]
+
+
+def render_sdg_pie_chart(data: List[Tuple[str, str, float]], title: str):
+    """Display an Altair donut chart summarizing SDG distribution."""
+    if not data:
+        st.info(f"No SDG predictions available for {title.lower()}.")
+        return
+    df = pd.DataFrame(data, columns=["code", "SDG", "Value"])
+    label_by_code: Dict[str, str] = {}
+    for code, label, _ in data:
+        label_by_code.setdefault(code, label)
+
+    def _code_sort_key(code: str) -> Tuple[int, str]:
+        return (int(code), code) if code.isdigit() else (99, code)
+
+    ordered_codes = sorted(label_by_code.keys(), key=_code_sort_key)
+    domain = [label_by_code[code] for code in ordered_codes]
+    colors = [SDG_COLORS.get(code, "#9ca3af") for code in ordered_codes]
+    chart = (
+        alt.Chart(df)
+        .mark_arc(innerRadius=70)
+        .encode(
+            theta="Value",
+            color=alt.Color(
+                "SDG",
+                scale=alt.Scale(domain=domain, range=colors),
+                legend=alt.Legend(columns=1, labelLimit=300, titleLimit=300, title="Sustainable Development Goals"),
+            ),
+            tooltip=[
+                alt.Tooltip("SDG", title="Sustainable Development Goal"),
+                alt.Tooltip("Value", format=".1f", title="Concordance in %"),
+            ],
+        )
+        .properties(width=1650, height=450, title=title)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def render_oa_ring_chart(rows: List[Dict[str, Any]]) -> None:
+    """Show a ring chart splitting publications by open access (True/False)."""
+    counts = {"Open access": 0, "Closed": 0}
+    truthy = {"1", "true", "yes", "y", "t"}
+    for row in rows:
+        is_oa = row.get("is_oa")
+        if isinstance(is_oa, bool):
+            counts["Open access" if is_oa else "Closed"] += 1
+            continue
+        if is_oa is None or is_oa == "":
+            counts["Closed"] += 1
+            continue
+        counts["Open access" if str(is_oa).strip().lower() in truthy else "Closed"] += 1
+    total = counts["Open access"] + counts["Closed"]
+    if total == 0:
+        st.info("No records contain an `is_oa` flag.")
+        return
+    chart_df = pd.DataFrame(
+        [
+            {"label": label, "count": value, "share": value / total}
+            for label, value in counts.items()
+            if value > 0
+        ]
+    )
+
+    colors = {"Open access": "#0c6b2f", "Closed": "#6b7280"}
+    chart = (
+        alt.Chart(chart_df)
+        .mark_arc(innerRadius=70)
+        .encode(
+            theta=alt.Theta("count:Q", title="Publications"),
+            color=alt.Color(
+                "label:N",
+                scale=alt.Scale(domain=list(colors.keys()), range=[colors[key] for key in colors]),
+                legend=alt.Legend(title="Access status", columns=1),
+            ),
+            tooltip=[
+                alt.Tooltip("label:N", title="Access"),
+                alt.Tooltip("count:Q", title="Publications"),
+                alt.Tooltip("share:Q", title="Share", format=".1%"),
+            ],
+        )
+        .properties(width=1650, height=450, title="Open access vs closed")
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def render_institution_network(
+    rows: List[Dict[str, Any]],
+    start_date: str,
+    end_date: str,
+    selected_institution_id: Optional[str],
+    max_nodes: int = 30,
+    min_second_level_weight: int = 2,
+) -> None:
+    """Render a simple 3D co-affiliation network of institutions from the selected period."""
+    if not rows:
+        st.info("No publications available to display the co-affiliation network.")
+        return
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No publications available to display the co-affiliation network.")
+        return
+
+    start_dt = pd.to_datetime(start_date, errors="coerce")
+    end_dt = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        st.info("Unable to determine the selected time frame for the network.")
+        return
+    if "publication_date" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_date"], errors="coerce")
+    else:
+        df["pub_date"] = pd.NaT
+    df = df.dropna(subset=["pub_date"])
+    if df.empty:
+        st.info("No publications have valid dates for the network.")
+        return
+    df = df[(df["pub_date"] >= start_dt) & (df["pub_date"] <= end_dt)]
+    if df.empty:
+        st.info("No publications fall within the selected time frame for the network.")
+        return
+
+    edge_counts: Dict[Tuple[str, str], int] = {}
+    inst_labels: Dict[str, str] = {}
+    inst_countries: Dict[str, str] = {}
+    rows_unique_ids: List[List[str]] = []
+    for _, row in df.iterrows():
+        aff_json = row.get("institution_affiliations_json")
+        try:
+            affiliations = json.loads(aff_json) if aff_json else []
+        except Exception:
+            affiliations = []
+        # fallback: build from columns if json missing
+        if not affiliations:
+            raw_ids = str(row.get("institution_ids") or "").split(";")
+            raw_names = str(row.get("institution_names_raw") or row.get("institutions") or "").split(";")
+            raw_countries = str(row.get("institution_countries") or "").split(";")
+            affiliations = []
+            for idx, inst_id in enumerate(raw_ids):
+                inst_id = inst_id.strip()
+                if not inst_id:
+                    continue
+                name = raw_names[idx].strip() if idx < len(raw_names) else ""
+                country = raw_countries[idx].strip() if idx < len(raw_countries) else ""
+                affiliations.append({"id": inst_id, "name": name, "country": country})
+        unique_ids = []
+        for aff in affiliations:
+            inst_id = aff.get("id") or ""
+            if not inst_id:
+                continue
+            if inst_id not in unique_ids:
+                unique_ids.append(inst_id)
+            name = aff.get("name") or ""
+            country = (aff.get("country") or "").upper()
+            if name:
+                inst_labels.setdefault(inst_id, name)
+            if country:
+                inst_countries.setdefault(inst_id, country)
+        rows_unique_ids.append(unique_ids)
+        if len(unique_ids) < 2:
+            continue
+        for a, b in itertools.combinations(sorted(unique_ids), 2):
+            edge_counts[(a, b)] = edge_counts.get((a, b), 0) + 1
+
+    if not edge_counts:
+        st.info("No co-affiliations found to build a network.")
+        return
+
+    # Collapse IDs that share the same label to avoid duplicate-looking nodes.
+    id_to_label: Dict[str, str] = {}
+    for inst_id in set(inst_labels.keys()) | set(inst_countries.keys()):
+        country = inst_countries.get(inst_id)
+        base_label = inst_labels.get(inst_id) or inst_id.split('/')[-1] or inst_id
+        if country:
+            base_label = f"{base_label} ({country})"
+        id_to_label[inst_id] = base_label
+
+    pubs_per_label: Dict[str, int] = {}
+    for unique_ids in rows_unique_ids:
+        for lab in {id_to_label.get(uid, uid) for uid in unique_ids}:
+            pubs_per_label[lab] = pubs_per_label.get(lab, 0) + 1
+
+    label_edge_counts: Dict[Tuple[str, str], int] = {}
+    for (a, b), w in edge_counts.items():
+        la = id_to_label.get(a, a)
+        lb = id_to_label.get(b, b)
+        if la == lb:
+            continue
+        key = tuple(sorted((la, lb)))
+        label_edge_counts[key] = label_edge_counts.get(key, 0) + w
+
+    if not label_edge_counts:
+        st.info("No co-affiliations found to build a network.")
+        return
+
+    st.caption(
+        "Each **node** is an institution (from OpenAlex authorship affiliations). An **edge** means two "
+        "institutions appeared together on at least one publication in your result set—shared co-authorship "
+        "across institutions. **Link-strength** on a node sums edge weights to every partner (each weight is "
+        "how many papers list that pair); one paper with many institutions adds a lot to that sum, so it is "
+        "usually *not* the same as publication count—use the hover **publications in this view** figure for that."
+    )
+
+    deg_full: Dict[str, int] = {}
+    for (a, b), w in label_edge_counts.items():
+        deg_full[a] = deg_full.get(a, 0) + w
+        deg_full[b] = deg_full.get(b, 0) + w
+    label_universe = sorted(set(deg_full.keys()))
+
+    focus_q = st.text_input(
+        "Search institution to center the network (optional)",
+        value="",
+        key="coaffil_network_search",
+        help="Type part of a name; matches are institution labels in your data. "
+        "Leave empty to use the institution you queried (when applicable) or show the full graph.",
+    )
+    q = (focus_q or "").strip().lower()
+    focus_override: Optional[str] = None
+    if q:
+        candidates = [lab for lab in label_universe if q in lab.lower()]
+        candidates.sort(key=lambda lab: (-deg_full.get(lab, 0), lab))
+        if not candidates:
+            st.warning("No institution in this result set matches that search.")
+        elif len(candidates) == 1:
+            focus_override = candidates[0]
+        else:
+            focus_override = st.selectbox(
+                "Multiple matches — pick one",
+                options=candidates,
+                index=0,
+                key="coaffil_network_pick",
+            )
+
+    # If we have the selected / focused institution in our labels, keep only edges attached to it.
+    selected_label: Optional[str] = None
+    if focus_override:
+        selected_label = focus_override
+    elif selected_institution_id:
+        selected_label = id_to_label.get(selected_institution_id) or id_to_label.get(
+            selected_institution_id.strip().split("/")[-1]
+        )
+    if selected_label:
+        primary_edges = {
+            edge: weight
+            for edge, weight in label_edge_counts.items()
+            if selected_label in edge
+        }
+        neighbors: Set[str] = set()
+        for (a, b) in primary_edges.keys():
+            neighbors.update([a, b])
+        neighbors.discard(selected_label)
+        secondary_edges = {
+            edge: weight
+            for edge, weight in label_edge_counts.items()
+            if edge[0] in neighbors and edge[1] in neighbors and weight >= min_second_level_weight
+        }
+        combined = {**primary_edges, **secondary_edges}
+        if combined:
+            label_edge_counts = combined
+
+    degree: Dict[str, int] = {}
+    for (a, b), w in label_edge_counts.items():
+        degree[a] = degree.get(a, 0) + w
+        degree[b] = degree.get(b, 0) + w
+
+    # Limit to top nodes by degree, but ensure the selected node stays if present.
+    top_nodes = set(sorted(degree, key=degree.get, reverse=True)[:max_nodes])
+    if selected_label and selected_label in degree:
+        top_nodes.add(selected_label)
+    filtered_edges = {(a, b): w for (a, b), w in label_edge_counts.items() if a in top_nodes and b in top_nodes}
+    if not filtered_edges:
+        st.info("Co-affiliations exist but were filtered out by the top-n limit.")
+        return
+
+    # Layout: keep selected at center (if present), scatter others randomly.
+    import random
+
+    node_positions: Dict[str, Tuple[float, float, float]] = {}
+    if selected_label and selected_label in top_nodes:
+        node_positions[selected_label] = (0.0, 0.0, 0.0)
+
+    primary_neighbors: Set[str] = set()
+    if selected_label:
+        for a, b in filtered_edges.keys():
+            if a == selected_label:
+                primary_neighbors.add(b)
+            elif b == selected_label:
+                primary_neighbors.add(a)
+    secondary_nodes = set(top_nodes) - primary_neighbors - ({selected_label} if selected_label else set())
+
+    # Use a spring layout to keep connected nodes closer together.
+    G = nx.Graph()
+    for node in top_nodes:
+        G.add_node(node)
+    for (a, b), w in filtered_edges.items():
+        G.add_edge(a, b, weight=w)
+
+    pos = nx.spring_layout(
+        G,
+        weight="weight",
+        dim=3,
+        center=(0, 0, 0),
+        seed=42,
+    )
+    if selected_label and selected_label in pos:
+        pos[selected_label] = [0.0, 0.0, 0.0]
+
+    node_positions = {
+        node: tuple((coords.tolist() if hasattr(coords, "tolist") else list(coords))[:3])
+        for node, coords in pos.items()
+    }
+
+    edge_traces = []
+    for (a, b), w in filtered_edges.items():
+        x0, y0, z0 = node_positions[a]
+        x1, y1, z1 = node_positions[b]
+        width = max(1.0, min(10.0, w * 2.0))
+        alpha = min(1.0, 0.5 + 0.2 * (w - 1))
+        mid_x = (x0 + x1) / 2
+        mid_y = (y0 + y1) / 2
+        mid_z = (z0 + z1) / 2
+        edge_color = f"rgba(93,93,93,{alpha})"
+        edge_traces.append(
+            go.Scatter3d(
+                x=[x0, x1, mid_x, None],
+                y=[y0, y1, mid_y, None],
+                z=[z0, z1, mid_z, None],
+                mode="lines",
+                line=dict(color=edge_color, width=width),
+                hoverinfo="text",
+                text=["", "", f"Co-authored works: {w}", ""],
+                hoverlabel=dict(bgcolor=edge_color, font=dict(color="#ffffff")),
+            )
+        )
+
+    node_x = []
+    node_y = []
+    node_z = []
+    node_sizes = []
+    node_text = []
+    max_deg = max(degree.get(n, 1) for n in top_nodes)
+    for node in top_nodes:
+        x, y, z = node_positions[node]
+        node_x.append(x)
+        node_y.append(y)
+        node_z.append(z)
+        deg = degree.get(node, 1)
+        n_pubs = pubs_per_label.get(node, 0)
+        node_sizes.append(10 + (deg / max_deg) * 25)
+        base_label = node
+        node_text.append(f"{base_label} · {n_pubs} publications · link-strength {deg}")
+
+    node_trace = go.Scatter3d(
+        x=node_x,
+        y=node_y,
+        z=node_z,
+        mode="markers+text",
+        marker=dict(
+            size=node_sizes,
+            color=node_sizes,
+            colorscale=[[0, "#b4a4e8"], [1, "#4d1fe3"]],  # light violet to dark
+            showscale=True,
+            colorbar=dict(title="Link strength"),
+            opacity=0.999,
+        ),
+        text=[txt.split(" · ", 1)[0] for txt in node_text],
+        textposition="top center",
+        textfont=dict(size=14),
+        hovertext=node_text,
+        hoverinfo="text",
+    )
+    fig = go.Figure(data=edge_traces + [node_trace])
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=0, r=0, t=0, b=0),
+        scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
+    )
+    fig.update_layout(height=650)
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_author_oa_chart(
+    rows: List[Dict[str, Any]], start_date: str, end_date: str, max_authors: int = 20
+) -> None:
+    """Show top authors by OA availability across the selected window."""
+    if not rows:
+        st.info("No publications available to display per-author OA status.")
+        return
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No publications available to display per-author OA status.")
+        return
+
+    start_month = pd.to_datetime(start_date, errors="coerce")
+    end_month = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_month) or pd.isna(end_month):
+        st.info("Unable to determine the selected time frame for author distribution.")
+        return
+    start_month = start_month.to_period("M").to_timestamp()
+    end_month = end_month.to_period("M").to_timestamp()
+    if start_month > end_month:
+        start_month, end_month = end_month, start_month
+
+    if "publication_date" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_date"], errors="coerce")
+    else:
+        df["pub_date"] = pd.NaT
+    if df["pub_date"].isna().all() and "publication_year" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_year"].astype(str), format="%Y", errors="coerce")
+    df = df.dropna(subset=["pub_date"])
+    if df.empty:
+        st.info("No publications have a valid publication date for this time frame.")
+        return
+    df["pub_month"] = df["pub_date"].dt.to_period("M").dt.to_timestamp()
+    df = df[(df["pub_month"] >= start_month) & (df["pub_month"] <= end_month)]
+    if df.empty:
+        st.info("No publications fall within the selected publication period.")
+        return
+
+    if "authors" not in df.columns:
+        st.info("No author information available in these records.")
+        return
+    df["authors"] = df["authors"].fillna("").astype(str)
+    exploded = (
+        df.assign(author=df["authors"].str.split(";"))
+        .explode("author")
+        .assign(author=lambda d: d["author"].str.strip())
+    )
+    exploded = exploded[exploded["author"] != ""]
+    if exploded.empty:
+        st.info("No author information is available to build this chart.")
+        return
+    if "is_oa" not in exploded.columns:
+        exploded["is_oa"] = False
+    exploded["is_oa"] = exploded["is_oa"].astype(bool)
+    grouped = (
+        exploded.groupby(["author", "is_oa"], dropna=False)
+        .size()
+        .reset_index(name="count")
+    )
+    if grouped.empty:
+        st.info("No author publication counts available.")
+        return
+    grouped["oa_status"] = grouped["is_oa"].map({True: "Open access", False: "Closed"})
+    totals = grouped.groupby("author")["count"].sum().nlargest(max_authors)
+    grouped = grouped[grouped["author"].isin(totals.index)]
+    grouped["author"] = pd.Categorical(
+        grouped["author"], categories=totals.index.tolist(), ordered=True
+    )
+    ordered_statuses = ["Open access", "Closed"]
+    order_mapping = {status: idx for idx, status in enumerate(ordered_statuses)}
+    grouped["status_order"] = grouped["oa_status"].map(order_mapping)
+    color_range = ["#0c6b2f", "#6b7280"]
+
+    chart = (
+        alt.Chart(grouped)
+        .mark_bar()
+        .encode(
+            x=alt.X("count:Q", title="Publications", axis=alt.Axis(format="d")),
+            y=alt.Y(
+                "author:N",
+                title="Author",
+                sort=totals.index.tolist(),
+            ),
+            color=alt.Color(
+                "oa_status:N",
+                title="Open-Access status",
+                scale=alt.Scale(domain=ordered_statuses, range=color_range),
+            ),
+            order=alt.Order("status_order:Q", sort="descending"),
+            tooltip=[
+                alt.Tooltip("author:N", title="Author"),
+                alt.Tooltip("oa_status:N", title="OA status"),
+                alt.Tooltip("count:Q", title="Publications"),
+            ],
+        )
+        .properties(
+            width=1650,
+            height=max(300, 40 * len(totals)),
+            title=f"OA status distribution for top {len(totals)} authors",
+        )
+    )
+    st.altair_chart(chart, use_container_width=True)
+    st.caption("Authors ranked by number of publications in the selected period.")
+
+
+def render_oa_status_chart(rows: List[Dict[str, Any]], start_date: str, end_date: str):
+    """Plot stacked OA status counts per month for the selected period."""
+    if not rows:
+        st.info("No publications available in the selected time frame.")
+        return
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No publications available in the selected time frame.")
+        return
+
+    start_month = pd.to_datetime(start_date, errors="coerce")
+    end_month = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_month) or pd.isna(end_month):
+        st.info("Unable to determine the selected time frame.")
+        return
+    start_month = start_month.to_period("M").to_timestamp()
+    end_month = end_month.to_period("M").to_timestamp()
+    if start_month > end_month:
+        start_month, end_month = end_month, start_month
+
+    if "publication_date" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_date"], errors="coerce")
+    else:
+        df["pub_date"] = pd.NaT
+    if df["pub_date"].isna().all() and "publication_year" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_year"].astype(str), format="%Y", errors="coerce")
+    df = df.dropna(subset=["pub_date"])
+    if df.empty:
+        st.info("No publications have a valid publication date for this time frame.")
+        return
+
+    df["pub_month"] = df["pub_date"].dt.to_period("M").dt.to_timestamp()
+    df = df[(df["pub_month"] >= start_month) & (df["pub_month"] <= end_month)]
+    if df.empty:
+        st.info("No publications fall within the selected publication period.")
+        return
+    if "oa_status" not in df.columns:
+        df["oa_status"] = "unknown"
+    else:
+        df["oa_status"] = df["oa_status"].fillna("unknown")
+        df.loc[df["oa_status"].astype(str).str.strip() == "", "oa_status"] = "unknown"
+
+    grouped = (
+        df.groupby(["pub_month", "oa_status"], dropna=False)
+        .size()
+        .reset_index(name="count")
+    )
+    if grouped.empty:
+        st.info("No publications fall within the selected publication period.")
+        return
+
+    month_range = pd.date_range(start=start_month, end=end_month, freq="MS")
+    status_values = sorted(grouped["oa_status"].unique())
+    scaffold = (
+        pd.DataFrame({"pub_month": month_range})
+        .assign(key=1)
+        .merge(pd.DataFrame({"oa_status": status_values, "key": 1}), on="key")
+        .drop(columns="key")
+    )
+    chart_df = scaffold.merge(grouped, on=["pub_month", "oa_status"], how="left").fillna({"count": 0})
+    chart_df["count"] = chart_df["count"].astype(int)
+    ordered_statuses = [
+        *[status for status in OA_STATUS_ORDER if status in status_values],
+        *[status for status in status_values if status not in OA_STATUS_ORDER],
+    ]
+    order_mapping = {status: idx for idx, status in enumerate(ordered_statuses)}
+    chart_df["status_order"] = chart_df["oa_status"].map(order_mapping).fillna(len(order_mapping)).astype(int)
+    color_range = [OA_STATUS_COLORS.get(status, "#94a3b8") for status in ordered_statuses]
+
+    chart = (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("yearmonth(pub_month):T", title="Publication month"),
+            y=alt.Y("count:Q", stack="zero", title="Publications", axis=alt.Axis(format="d")),
+            color=alt.Color(
+                "oa_status:N",
+                title="Open-Access status",
+                scale=alt.Scale(domain=ordered_statuses, range=color_range),
+            ),
+            order=alt.Order("status_order:Q", sort="descending"),
+            tooltip=[
+                alt.Tooltip("yearmonth(pub_month):T", title="Month"),
+                alt.Tooltip("oa_status:N", title="OA status"),
+                alt.Tooltip("count:Q", title="Publications"),
+            ],
+        )
+        .properties(
+            width=1650,
+            height=400,
+            title=f"Publications from {start_month:%b %Y} to {end_month:%b %Y}",
+        )
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def render_publication_type_chart(rows: List[Dict[str, Any]], start_date: str, end_date: str):
+    """Render a pie chart showing publication types in the window."""
+    if not rows:
+        st.info("No publications available to display publication types.")
+        return
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No publications available to display publication types.")
+        return
+
+    start_month = pd.to_datetime(start_date, errors="coerce")
+    end_month = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_month) or pd.isna(end_month):
+        st.info("Unable to determine the selected time frame to calculate publication types.")
+        return
+    start_month = start_month.to_period("M").to_timestamp()
+    end_month = end_month.to_period("M").to_timestamp()
+    if start_month > end_month:
+        start_month, end_month = end_month, start_month
+
+    if "publication_date" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_date"], errors="coerce")
+    else:
+        df["pub_date"] = pd.NaT
+    if df["pub_date"].isna().all() and "publication_year" in df.columns:
+        df["pub_date"] = pd.to_datetime(df["publication_year"].astype(str), format="%Y", errors="coerce")
+    df = df.dropna(subset=["pub_date"])
+    if df.empty:
+        st.info("No publications have a valid publication date for this time frame.")
+        return
+
+    df["pub_month"] = df["pub_date"].dt.to_period("M").dt.to_timestamp()
+    df = df[(df["pub_month"] >= start_month) & (df["pub_month"] <= end_month)]
+    if df.empty:
+        st.info("No publications fall within the selected publication period.")
+        return
+
+    if "type" not in df.columns:
+        st.info("No publication type information is available to build this chart.")
+        return
+    df["type"] = df["type"].fillna("").astype(str).str.strip()
+    df.loc[df["type"] == "", "type"] = "unknown"
+
+    grouped = (
+        df.groupby("type", dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+    )
+    if grouped.empty:
+        st.info("No publication type data available for this period.")
+        return
+    grouped["percentage"] = grouped["count"] / grouped["count"].sum() * 100
+
+    chart = (
+        alt.Chart(grouped)
+        .mark_arc(innerRadius=70)
+        .encode(
+            theta=alt.Theta("count:Q", title="Publications"),
+            color=alt.Color(
+                "type:N",
+                title="Publication type",
+                legend=alt.Legend(columns=2, labelLimit=240),
+            ),
+            tooltip=[
+                alt.Tooltip("type:N", title="Publication type"),
+                alt.Tooltip("count:Q", format="d", title="Publications"),
+                alt.Tooltip("percentage:Q", format=".1f", title="Share (%)"),
+            ],
+        )
+        .properties(
+            width=1650,
+            height=450,
+            title="Publication type distribution in the selected time frame",
+        )
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def build_output_filename(
+    entity_slug: str,
+    wtype: Optional[str],
+    model: str,
+    from_date: str,
+    to_date: Optional[str],
+    limit_rows: Optional[int],
+) -> str:
+    """Generate a descriptive filename that encodes filters and limits."""
+    tail = entity_slug.rstrip("/").split("/")[-1]
+    type_part = wtype or "all"
+    model_part = model if model != "skip" else "no-sdg"
+    fname = f"openalex_{tail}_{type_part}_{model_part}_{from_date}"
+    if to_date and to_date != from_date:
+        fname += f"_to{to_date}"
+    if limit_rows:
+        fname += f"_n{limit_rows}"
+    return sanitize_filename(f"{fname}.csv")
+
+
+def rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    """Serialize result rows into UTF-8 encoded CSV bytes."""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDNAMES)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: row.get(field, "") for field in CSV_FIELDNAMES})
+    buffer.seek(0)
+    return buffer.getvalue().encode("utf-8")
+
+
+def _excel_col_name(idx: int) -> str:
+    """Convert a zero-based index to Excel-style column letters."""
+    name = ""
+    while idx >= 0:
+        idx, remainder = divmod(idx, 26)
+        name = chr(65 + remainder) + name
+        idx -= 1
+    return name
+
+
+def rows_to_excel_bytes(rows: List[Dict[str, Any]], columns: Optional[List[str]] = None) -> bytes:
+    """Write rows to an XLSX workbook without bringing in pandas/excel libs."""
+    columns = columns or CSV_FIELDNAMES
+    if not columns:
+        columns = list({key for row in rows for key in row.keys()})
+    sheet_rows: List[str] = []
+    row_index = 1
+    header_cells = []
+    for col_idx, col_name in enumerate(columns):
+        cell_ref = f"{_excel_col_name(col_idx)}{row_index}"
+        header_cells.append(
+            f'<c r="{cell_ref}" t="inlineStr"><is><t>{escape(str(col_name))}</t></is></c>'
+        )
+    sheet_rows.append(f'<row r="{row_index}">{"".join(header_cells)}</row>')
+    for row in rows:
+        row_index += 1
+        cells = []
+        for col_idx, col_name in enumerate(columns):
+            value = row.get(col_name, "")
+            text = "" if value is None else str(value)
+            cell_ref = f"{_excel_col_name(col_idx)}{row_index}"
+            cells.append(
+                f'<c r="{cell_ref}" t="inlineStr"><is><t>{escape(text)}</t></is></c>'
+            )
+        sheet_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(sheet_rows)}</sheetData>"
+        "</worksheet>"
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        "</Relationships>"
+    )
+
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
+    )
+
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+        "</Types>"
+    )
+
+    core_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"<dc:title>{escape('OpenAlex Results')}</dc:title>"
+        "</cp:coreProperties>"
+    )
+
+    app_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        "<Application>Streamlit</Application>"
+        "</Properties>"
+    )
+
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", rels_xml)
+        zf.writestr("docProps/core.xml", core_xml)
+        zf.writestr("docProps/app.xml", app_xml)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr("xl/styles.xml", styles_xml)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _strip_browser_query_params() -> None:
+    """
+    Strip URL query (?...) parameters that Streamlit mirrors into widget state.
+
+    Stale keys from older builds can break deserialization (selectbox/radio bugs on some installs).
+    """
+    try:
+        qp = getattr(st, "query_params", None)
+        if qp is not None:
+            qp.clear()
+    except Exception:
+        try:
+            st.experimental_set_query_params()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _purge_legacy_streamlit_widget_keys() -> None:
+    """Drop cached state for removed widgets (avoids broken deserialize after refactors)."""
+    for k in (
+        "sdg_pub_type_pick",
+        "sdg_model_pick",
+        "preview_focus_pick_v2",
+        "query_target_select",
+        "sdg_query_target",
+        "institution_match_select",
+        "institution_choice",
+    ):
+        st.session_state.pop(k, None)
+
+
+def render_query_target_via_buttons() -> str:
+    """Return 'institution' or 'author' without radio/selectbox (deserialization-safe)."""
+    st.markdown("**Search by**")
+    if "_ui_query_target" not in st.session_state:
+        st.session_state["_ui_query_target"] = "institution"
+    mode = str(st.session_state["_ui_query_target"])
+    col_i, col_a = st.columns(2)
+    with col_i:
+        if st.button(
+            QUERY_TARGET_LABEL_INSTITUTION,
+            key="pick_institution_mode_btn",
+            use_container_width=True,
+        ):
+            if mode != "institution":
+                st.session_state["_ui_query_target"] = "institution"
+                st.rerun()
+    with col_a:
+        if st.button(
+            QUERY_TARGET_LABEL_AUTHOR,
+            key="pick_author_mode_btn",
+            use_container_width=True,
+        ):
+            if mode != "author":
+                st.session_state["_ui_query_target"] = "author"
+                st.rerun()
+    st.caption(f"Active: {'Institution search' if mode == 'institution' else 'Author search'}")
+    return mode
+
+
+def render_author_selector(
+    user_agent: str,
+    scopus_api_key: Optional[str] = None,
+    scopus_insttoken: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve ORCID, OpenAlex author URL/id, or Scopus author ID.
+
+    With Elsevier credentials, numeric Scopus IDs follow: **Scopus → Elsevier (ORCID) → OpenAlex**
+    by ORCID, then publications use **`author.id`** on the Works API.
+
+    Returns (author_openalex_token, display_name).
+    """
+    st.subheader("1. Author", divider="violet")
+    _have_els = bool(scopus_api_key and (scopus_insttoken or "").strip())
+    st.caption(
+        "Paste an ORCID (URL or 0000-0001-2345-6789), an OpenAlex author URL "
+        "(https://openalex.org/A…), or a numeric Scopus author ID, then click **Resolve author**."
+        + (
+            " **Scopus IDs:** Elsevier reads ORCID from the Scopus author profile, "
+            "then OpenAlex resolves the author by that ORCID; works query `author.id`."
+            " Same **scopus_api_key** / **scopus_insttoken** as abstracts."
+            if _have_els
+            else " **Scopus IDs without Elsevier keys:** only OpenAlex `filter=scopus` "
+            "(often empty); prefer adding **scopus_api_key** + **scopus_insttoken** for ORCID-based resolution."
+        )
+    )
+    st.markdown(
+        "Browse and explore authors in OpenAlex: "
+        "[openalex.org/authors](https://openalex.org/authors)."
+    )
+    st.text_input(
+        "Author identifier",
+        key="author_identifier_input",
+        placeholder="https://orcid.org/… | https://openalex.org/A… | Scopus ID",
+    )
+    _probe_id = (st.session_state.get("author_identifier_input") or "").strip()
+    if looks_like_scopus_author_id(_probe_id) and not _have_els:
+        st.warning(
+            "Numeric **Scopus** author IDs need Elsevier **api key + insttoken** loaded as "
+            "non-empty values. In `.streamlit/secrets.toml`, set `scopus_api_key` and "
+            "`scopus_insttoken` (not commented out), **or** put `SCOPUS_API_KEY` / "
+            "`SCOPUS_INSTTOKEN` in `.env`. Restart Streamlit after saving. "
+            "Empty strings are treated as missing."
+        )
+    resolve_clicked = st.button("Resolve author", type="primary", key="resolve_author_btn")
+    if resolve_clicked:
+        raw = (st.session_state.get("author_identifier_input") or "").strip()
+        if not raw:
+            st.warning("Enter an ORCID, OpenAlex author URL, or Scopus author ID.")
+            st.session_state.pop("author_resolved_id", None)
+            st.session_state.pop("author_resolved_name", None)
+            st.session_state.pop("author_resolve_note", None)
+        else:
+            spinner_msg = (
+                "Scopus ID → Elsevier (ORCID) → OpenAlex…"
+                if looks_like_scopus_author_id(raw) and scopus_api_key and (scopus_insttoken or "").strip()
+                else "Looking up author…"
+            )
+            with st.spinner(spinner_msg):
+                try:
+                    aid, name, err, resolve_note = resolve_author_openalex_id(
+                        raw,
+                        user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
+                        scopus_api_key=scopus_api_key,
+                        scopus_insttoken=scopus_insttoken,
+                    )
+                except requests.RequestException as exc:
+                    aid, name, err, resolve_note = None, None, str(exc), None
+            if err:
+                st.error(err)
+                st.session_state.pop("author_resolved_id", None)
+                st.session_state.pop("author_resolved_name", None)
+                st.session_state.pop("author_resolve_note", None)
+            else:
+                st.session_state["author_resolved_id"] = aid
+                st.session_state["author_resolved_name"] = name or ""
+                st.session_state["author_resolve_note"] = resolve_note or ""
+                st.success(f"Resolved: **{name or aid}** (`{aid}`)")
+
+    aid = st.session_state.get("author_resolved_id")
+    raw_name = st.session_state.get("author_resolved_name")
+    display_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
+    if aid:
+        st.info(
+            f"Active author: **{display_name or aid}** (`{aid}`). "
+            "Resolve again if you change the identifier."
+        )
+        rn = st.session_state.get("author_resolve_note") or ""
+        if isinstance(rn, str) and rn.strip():
+            st.caption("Resolution path")
+            st.markdown(rn.strip())
+    return aid if isinstance(aid, str) else None, display_name
+
+
+def render_institution_selector(user_agent: str) -> Tuple[Optional[str], bool]:
+    """Show the institution search box, lineage toggle, and return (institution_id, include_lineage)."""
+    st.subheader("1. Institution", divider="violet")
+
+    with st.form("institution_search_form", clear_on_submit=False):
+        search_query = st.text_input(
+            "Search by institution name first", placeholder="Europa-Universität Viadrina"
+        )
+        submitted = st.form_submit_button("Search OpenAlex institutions", type="primary")
+    search_results: Optional[List[dict]] = st.session_state.get("institution_search_results")
+    search_ran = st.session_state.get("institution_search_ran", False)
+    if submitted:
+        if not search_query.strip():
+            st.warning("Please provide a search query.")
+        else:
+            with st.spinner("Searching institutions…"):
+                try:
+                    search_results = search_institutions_by_name(search_query.strip(), user_agent=user_agent)
+                except requests.HTTPError as exc:
+                    st.error(f"Institution search failed: {exc}")
+                    search_results = []
+                except requests.RequestException as exc:
+                    st.error(f"Institution search error: {exc}")
+                    search_results = []
+            st.session_state["institution_search_results"] = search_results or []
+            st.session_state["institution_search_ran"] = True
+    search_results = st.session_state.get("institution_search_results")
+    search_ran = st.session_state.get("institution_search_ran", False)
+    if search_results:
+        options: Dict[str, str] = {}
+        for item in search_results:
+            inst_id = item.get("id") or item.get("ror")
+            if not inst_id:
+                continue
+            country = (item.get("country_code") or "").upper()
+            ror_val = item.get("ror")
+            tail = ror_val or inst_id
+            if not ror_val:
+                tail = f"{tail} [no ROR]"
+            label = f"{item.get('display_name', '—')} ({country}) — {tail}"
+            options[label] = inst_id
+        if options:
+            st.markdown("**Matches** — click one to select")
+            # Buttons avoid Streamlit browser-query sync bugs with selectboxes on some installs.
+            for idx, (label, cand_id) in enumerate(options.items()):
+                token = cand_id.strip().replace("https://", "").replace("/", "_").replace("-", "_")
+                suffix = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in token)[:56]
+                if st.button(
+                    label[:300] + ("…" if len(label) > 300 else ""),
+                    key=f"inst_match_btn_{idx}_{suffix}",
+                ):
+                    st.session_state["selected_institution_id"] = cand_id
+                    st.session_state["selected_institution_meta"] = next(
+                        (
+                            item
+                            for item in search_results
+                            if (item.get("id") or item.get("ror")) == cand_id
+                        ),
+                        {},
+                    )
+    elif search_ran:
+        st.info("No matches found.")
+
+    ror_input = st.text_input(
+        "…or enter an institution URL directly (OpenAlex institution or ROR)",
+        placeholder="https://openalex.org/I123456789 | https://ror.org/02msan859",
+        value=st.session_state.get("selected_institution_id", ""),
+    )
+    if ror_input and (is_ror_url(ror_input) or is_openalex_institution_id(ror_input)):
+        st.session_state["selected_institution_id"] = ror_input.strip()
+        st.session_state.pop("selected_institution_meta", None)
+        # fall through to checkbox/return below
+
+    include_lineage = st.checkbox(
+        "Include works from parent/child institutions (OpenAlex lineage)",
+        value=st.session_state.get("include_lineage", False),
+        help="If enabled, works from related institutions in the OpenAlex lineage list are included (when available).",
+        key="include_lineage_checkbox",
+    )
+    st.session_state["include_lineage"] = include_lineage
+    return st.session_state.get("selected_institution_id"), include_lineage
+    
+
+def render_publication_type_selector() -> Optional[str]:
+    """Pick OpenAlex work type using buttons (avoids selectbox + URL sync deserialization bugs)."""
+    st.subheader("2. Publication type", divider="blue")
+    types = [
+        "article",
+        "book",
+        "book-chapter",
+        "proceedings-article",
+        "proceedings",
+        "reference-entry",
+        "report",
+        "dissertation",
+        "dataset",
+        "review",
+        "editorial",
+        "letter",
+        "standard",
+        "other",
+    ]
+    pub_options = ["All"] + types
+    default_choice = pub_options[0]
+    if st.session_state.get("_pub_type_choice") not in pub_options:
+        st.session_state["_pub_type_choice"] = default_choice
+    choice = str(st.session_state["_pub_type_choice"])
+    st.markdown(f"**Active filter:** `{choice}`")
+
+    ncols = 4
+    for r in range((len(pub_options) + ncols - 1) // ncols):
+        cols = st.columns(ncols)
+        for c in range(ncols):
+            ix = r * ncols + c
+            if ix >= len(pub_options):
+                break
+            opt = pub_options[ix]
+            short = opt if len(opt) <= 22 else f"{opt[:20]}…"
+            with cols[c]:
+                if st.button(short, key=f"pubtype_btn_{ix}"):
+                    st.session_state["_pub_type_choice"] = opt
+                    st.rerun()
+
+    return None if choice == "All" else choice
+
+
+def render_model_selector() -> str:
+    """Pick SDG model via buttons (avoids selectbox deserialize issues)."""
+    st.subheader("3. SDG classifier", divider="green")
+    default_name = next((n for n, _ in AURORA_MODELS if n == "aurora-sdg-multi"), AURORA_MODELS[0][0])
+    valid_ids = {n for n, _ in AURORA_MODELS}
+    if "_sdg_model_id" not in st.session_state:
+        st.session_state["_sdg_model_id"] = default_name
+    elif st.session_state["_sdg_model_id"] not in valid_ids:
+        st.session_state["_sdg_model_id"] = default_name
+    current_id = str(st.session_state["_sdg_model_id"])
+
+    for model_id, desc in AURORA_MODELS:
+        pressed = st.button(
+            f"{'◉ ' if model_id == current_id else '○ '}{desc}",
+            key=f"model_pick_{model_id}",
+        )
+        if pressed:
+            st.session_state["_sdg_model_id"] = model_id
+            st.rerun()
+    return current_id
+
+
+def render_advanced_options(
+    scopus_key_from_secret: Optional[str],
+    scopus_insttoken_from_secret: Optional[str],
+    default_from_secret: Optional[str],
+) -> Tuple[str, str, Optional[int]]:
+    """Render additional filters (date range, record limit, info callouts)."""
+    st.subheader("4. Advanced options", divider="grey")
+    today = datetime.today().date().replace(day=1)
+    start_str = default_from_secret or "2023-01-01"
+    try:
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").date().replace(day=1)
+    except ValueError:
+        start_date = date(2023, 1, 1)
+    months: List[date] = []
+    year = start_date.year
+    month = start_date.month
+    while year < today.year or (year == today.year and month <= today.month):
+        months.append(date(year, month, 1))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    if not months:
+        months = [today]
+    labels = [dt.strftime("%B %Y") for dt in months]
+    desired_start = date(today.year - 2, 1, 1)
+    start_default_date = next((m for m in months if m >= desired_start), months[-1])
+    si_default = months.index(start_default_date)
+    ei_default = len(months) - 1
+
+    max_ix = len(months) - 1
+    si = st.slider(
+        "Publication period — start (month)",
+        min_value=0,
+        max_value=max_ix,
+        value=min(si_default, max_ix),
+        key="adv_period_start_ix",
+        help="First month included in the OpenAlex date filter.",
+    )
+    ei = st.slider(
+        "Publication period — end (month)",
+        min_value=0,
+        max_value=max_ix,
+        value=min(ei_default, max_ix),
+        key="adv_period_end_ix",
+        help="Last month included.",
+    )
+    if si > ei:
+        si, ei = ei, si
+    from_date = months[si]
+    to_date = months[ei]
+    st.caption(
+        f"Including works published from **{labels[si]}** through **{labels[ei]}** "
+        f"({from_date:%Y-%m-%d} … {to_date:%Y-%m-%d})."
+    )
+    limit_value = st.number_input(
+        "Limit to first N records (0 = no limit)",
+        min_value=0,
+        value=0,
+        step=50,
+        help="Use to test the workflow without downloading everything.",
+    )
+    if not scopus_key_from_secret or not scopus_insttoken_from_secret:
+        st.info(
+            "Add both `scopus_api_key` and `scopus_insttoken` to .streamlit/secrets.toml to fetch "
+            "abstracts from Elsevier (Scopus) when OpenAlex lacks them."
+        )
+    return from_date.strftime("%Y-%m-%d"), to_date.strftime("%Y-%m-%d"), (limit_value or None)
+
+
+def _reset_fetch_state(
+    progress_bar: Any,
+    progress_text: Any,
+    progress_detail: Any,
+    cancel_container: Any,
+) -> None:
+    """Clear progress UI placeholders and reset fetch session flags."""
+    progress_bar.empty()
+    progress_text.empty()
+    progress_detail.empty()
+    cancel_container.empty()
+    st.session_state["fetch_in_progress"] = False
+    st.session_state["fetch_cancel_requested"] = False
+
+
+def main():
+    """Streamlit entry point that wires all widgets, fetch flow, and previews."""
+    st.set_page_config(page_title="Aurora SDG Publication Classifier", layout="wide")
+    _strip_browser_query_params()
+    _purge_legacy_streamlit_widget_keys()
+
+    st.title("Aurora SDG Publication Classifier")
+    st.caption(
+        "Fetch publications for an **institution** or an **author**, relate them to the 17 UN Sustainable "
+        "Development Goals (SDGs) using the [Aurora SDG classifier](https://aurora-universities.eu/sdg-research/classify/), "
+        "and export a CSV ready for analysis."
+    )
+
+    user_agent, has_user_agent_secret = resolve_user_agent()
+    if not has_user_agent_secret:
+        st.text_input(
+            "HTTP User-Agent (set via secrets.toml)",
+            value=user_agent,
+            disabled=True,
+        )
+        st.warning(
+            "Set `http_user_agent` in .streamlit/secrets.toml with your contact email "
+            "for better API treatment."
+        )
+
+    scopus_api_key = resolve_scopus_api_key()
+    scopus_insttoken = resolve_scopus_insttoken()
+
+    st.header("Query setup", divider="rainbow")
+    query_mode = render_query_target_via_buttons()
+    prev_mode = st.session_state.get("_prev_query_mode")
+    if prev_mode is not None and prev_mode != query_mode:
+        if prev_mode == "author" and query_mode == "institution":
+            st.session_state.pop("author_resolved_id", None)
+            st.session_state.pop("author_resolved_name", None)
+            st.session_state.pop("author_resolve_note", None)
+        elif prev_mode == "institution" and query_mode == "author":
+            st.session_state.pop("selected_institution_id", None)
+            st.session_state.pop("selected_institution_meta", None)
+    st.session_state["_prev_query_mode"] = query_mode
+
+    institution_id: Optional[str] = None
+    include_lineage = False
+    author_openalex_id: Optional[str] = None
+    if query_mode == "institution":
+        institution_id, include_lineage = render_institution_selector(user_agent)
+    else:
+        author_openalex_id, _ = render_author_selector(
+            user_agent,
+            scopus_api_key=scopus_api_key,
+            scopus_insttoken=scopus_insttoken,
+        )
+    st.write("")
+    publication_type = render_publication_type_selector()
+    st.write("")
+    model = render_model_selector()
+    st.write("")
+    google_scholar_enabled = resolve_google_scholar_enabled()
+    serpapi_api_key = resolve_serpapi_key() # Retrieve SerpApi key
+    default_from_date = get_secret_text(SECRET_DEFAULT_START)
+    from_date_str, to_date_str, limit_rows = render_advanced_options(
+        scopus_api_key,
+        scopus_insttoken,
+        default_from_date,
+    )
+
+    result_payload_gate = st.session_state.get(RESULT_SESSION_KEY)
+    has_valid_institution = (
+        query_mode == "institution"
+        and bool(institution_id)
+        and (is_ror_url(institution_id) or is_openalex_institution_id(institution_id))
+    )
+    has_valid_author = query_mode == "author" and bool(author_openalex_id)
+    can_run_new_query = has_valid_institution or has_valid_author
+
+    if not can_run_new_query and not result_payload_gate:
+        if query_mode == "institution":
+            if institution_id and not (
+                is_ror_url(institution_id) or is_openalex_institution_id(institution_id)
+            ):
+                st.error(
+                    "Institution must be a valid ROR URL or OpenAlex institution URL "
+                    "(e.g., https://openalex.org/I123456789)."
+                )
+            else:
+                st.info("Pick an institution or paste a ROR/OpenAlex institution ID/URL to continue.")
+        else:
+            st.info("Resolve an author with **Resolve author** to continue.")
+        return
+
+    st.write("")
+    st.divider()
+    st.header("Run query and preview results", divider="rainbow")
+    if google_scholar_enabled:
+        if serpapi_api_key:
+            st.info("Google Scholar abstract lookups enabled (via SerpApi).", icon=":material/check_circle:")
+        else:
+            st.warning(
+                "Google Scholar abstract lookups enabled, but `serpapi_api_key` not set. "
+                "Will fall back to scholarly with free proxies (less reliable and slower)."
+            )
+
+    current_params = {
+        "mode": query_mode,
+        "institution": institution_id,
+        "author": author_openalex_id,
+        "type": publication_type,
+        "model": model,
+        "from": from_date_str,
+        "to": to_date_str,
+        "limit": limit_rows,
+    }
+
+    # If a fetch is running, check if parameters have changed.
+    # If they have, request a cancellation.
+    if st.session_state.get("fetch_in_progress"):
+        ongoing_fetch_params = st.session_state.get("fetch_params")
+        if ongoing_fetch_params and ongoing_fetch_params != current_params:
+            st.session_state["fetch_cancel_requested"] = True
+            st.toast("Parameters changed, cancelling active fetch...", icon="🛑")
+
+    result_payload = st.session_state.get(RESULT_SESSION_KEY)
+    st.session_state.setdefault("fetch_cancel_requested", False)
+    st.session_state.setdefault("fetch_in_progress", False)
+
+    cancel_button_placeholder = st.empty() # New placeholder for the cancel button
+
+    if not can_run_new_query and result_payload_gate:
+        st.caption("Resolve an author or choose a valid institution to run a new query.")
+
+    run_button_clicked = st.button(
+        "Fetch works and build CSV",
+        type="primary",
+        key="main_fetch_button",
+        disabled=not can_run_new_query,
+    )
+    if run_button_clicked: # Renamed run_button to run_button_clicked
+        st.session_state["fetch_params"] = current_params
+        st.session_state["fetch_cancel_requested"] = False
+        st.session_state["fetch_in_progress"] = True
+        st.rerun() # Trigger a rerun to enter the 'fetch_in_progress' block below
+
+    # This block handles rendering the cancel button and the actual fetch logic
+    if st.session_state.get("fetch_in_progress"):
+        # Render the cancel button inside its dedicated placeholder
+        if cancel_button_placeholder.button("Cancel fetch", type="secondary", key="cancel_fetch_button"):
+            st.session_state["fetch_cancel_requested"] = True
+            st.toast("Cancelling fetch…", icon=":material/stop_circle:")
+
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+        progress_detail = st.empty()
+        current_detail: str = ""
+
+        def progress_callback(done: int, expected: Optional[int], message: str):
+            nonlocal current_detail
+            target = limit_rows or expected
+            fraction = min(done / target, 1.0) if target else 0.0
+            progress_bar.progress(fraction)
+            if expected:
+                status = f"Processed {done:,} of {expected:,} works"
+            elif limit_rows:
+                status = f"Processed {done:,} of {limit_rows:,} requested works"
+            else:
+                status = f"Processed {done:,} works"
+            if message:
+                current_detail = message
+            if current_detail:
+                progress_detail.text(f"Currently processing: {current_detail}")
+            else:
+                progress_detail.empty()
+            progress_text.text(status)
+
+        lineage_ids: List[str] = []
+        if query_mode == "institution" and include_lineage and institution_id:
+            cached_meta = st.session_state.get("selected_institution_meta") or {}
+            lineage_ids = [str(val) for val in cached_meta.get("lineage") or [] if val]
+            if not lineage_ids:
+                lineage_ids = fetch_institution_lineage(institution_id, user_agent=user_agent)
+
+        if query_mode == "institution" and institution_id:
+            entity_slug = institution_id
+        else:
+            entity_slug = f"author_{author_openalex_id}"
+
+        filename = build_output_filename(
+            entity_slug,
+            publication_type,
+            model,
+            from_date_str,
+            to_date_str,
+            limit_rows,
+        )
+
+        def cancel_check() -> bool:
+            return bool(st.session_state.get("fetch_cancel_requested"))
+
+        with st.spinner("Contacting OpenAlex and Aurora APIs…"):
+            try:
+                if query_mode == "institution":
+                    rows, stats = _call_fetch_works_with_sdg(
+                        from_date_str,
+                        publication_type,
+                        model,
+                        institution_id=institution_id,
+                        to_date=to_date_str,
+                        limit_rows=limit_rows,
+                        user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
+                        scopus_api_key=scopus_api_key,
+                        scopus_insttoken=scopus_insttoken,
+                        enable_google_scholar=google_scholar_enabled,
+                        serpapi_api_key=serpapi_api_key, # Pass SerpApi key
+                        extra_institution_ids=lineage_ids if include_lineage else None,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    )
+                else:
+                    rows, stats = _call_fetch_works_with_sdg(
+                        from_date_str,
+                        publication_type,
+                        model,
+                        author_openalex_id=author_openalex_id,
+                        to_date=to_date_str,
+                        limit_rows=limit_rows,
+                        user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
+                        scopus_api_key=scopus_api_key,
+                        scopus_insttoken=scopus_insttoken,
+                        enable_google_scholar=google_scholar_enabled,
+                        serpapi_api_key=serpapi_api_key,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    )
+            except FetchCancelled:
+                _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
+                st.info("Fetch cancelled.", icon="⏹️")
+                return
+            except requests.HTTPError as exc:
+                _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
+                st.error(f"Request failed: {exc}")
+                return
+            except requests.RequestException as exc:
+                _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
+                st.error(f"Network error: {exc}")
+                return
+
+        _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
+        csv_bytes = rows_to_csv_bytes(rows)
+        result_payload = {
+            "csv_bytes": csv_bytes,
+            "rows": rows,
+            "stats": stats,
+            "filename": filename,
+            "params": current_params,
+        }
+        st.session_state[RESULT_SESSION_KEY] = result_payload
+        st.session_state.pop("preview_focus_index", None)
+        st.session_state["preview_page"] = 1
+        st.rerun() # Rerun to display results after fetch completes.
+
+    elif not result_payload:
+        st.info("Click the button above to fetch publications.")
+        return
+
+    csv_bytes: bytes = result_payload["csv_bytes"]
+    stats: FetchStats = result_payload["stats"]
+    filename: str = result_payload["filename"]
+    rows: Optional[List[Dict[str, Any]]] = result_payload.get("rows")
+    result_params: Dict[str, Any] = result_payload.get("params") or {}
+    result_mode = str(result_params.get("mode", "institution"))
+    result_institution_id: Optional[str] = result_params.get("institution")
+
+    gs_note = (
+        f"; retrieved from Google Scholar: **{stats.gs_abstract_retrieved:,}**."
+        if google_scholar_enabled
+        else "."
+    )
+    st.success(
+        f"Wrote **{stats.total_processed:,}** rows. "
+        f"Abstracts available: **{stats.total_abstracts_available:,}**. " # New line
+        f"OpenAlex missing abstracts: **{stats.openalex_abstract_missing:,}**; "
+        f"retrieved from Scopus (Elsevier): **{stats.scopus_abstract_retrieved:,}**"
+        f"{gs_note}"
+    )
+    if rows is None:
+        try:
+            csv_text = csv_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            csv_text = csv_bytes.decode("utf-8", errors="ignore")
+        all_rows = list(csv.DictReader(io.StringIO(csv_text)))
+    else:
+        all_rows = rows
+    total_rows = len(all_rows)
+    selected_index = st.session_state.get("preview_focus_index")
+    chart_rows: List[Dict[str, Any]] = all_rows
+    selected_title: Optional[str] = None
+    if total_rows > 0:
+        st.write("")  # spacing
+        st.subheader("Preview", divider="orange")
+        st.markdown(RADIO_CHECKBOX_CSS, unsafe_allow_html=True)
+        total_pages = max(1, math.ceil(total_rows / PREVIEW_PAGE_SIZE))
+        st.session_state.setdefault("preview_page", 1)
+        current_page = min(max(1, st.session_state["preview_page"]), total_pages)
+        if total_pages > 1:
+            first_col, prev_col, info_col, next_col, last_col = st.columns([1, 1, 2, 1, 1])
+
+            def set_page(target: int):
+                st.session_state["preview_page"] = max(1, min(total_pages, target))
+                st.rerun()
+
+            if first_col.button("⏮ First", disabled=current_page == 1):
+                set_page(1)
+            if prev_col.button("◀ Previous", disabled=current_page == 1):
+                set_page(current_page - 1)
+            if next_col.button("Next ▶", disabled=current_page == total_pages):
+                set_page(current_page + 1)
+            if last_col.button("Last ⏭", disabled=current_page == total_pages):
+                set_page(total_pages)
+            current_page = st.session_state["preview_page"]
+            info_col.markdown(f"Page **{current_page} / {total_pages}**")
+        else:
+            current_page = 1
+        start_index = (current_page - 1) * PREVIEW_PAGE_SIZE
+        preview_rows = build_preview_rows(
+            all_rows,
+            PREVIEW_COLUMNS,
+            limit=PREVIEW_PAGE_SIZE,
+            offset=start_index,
+        )
+        visible_indices = list(range(start_index, start_index + len(preview_rows)))
+        preview_df = pd.DataFrame(preview_rows)
+        if "authors" in preview_df.columns:
+            preview_df["authors"] = preview_df["authors"].apply(abbreviate_authors)
+        preview_df.insert(0, "#", range(start_index + 1, start_index + 1 + len(preview_df)))
+        rows_in_page = len(preview_df)
+        table_height = 980 if rows_in_page >= PREVIEW_PAGE_SIZE else max(200, rows_in_page * 35 + 120)
+        column_configs = {}
+        for column in preview_df.columns:
+            if column == "#":
+                column_configs[column] = st.column_config.NumberColumn(
+                    "#", help="Row number in this page", width="small"
+                )
+            elif column == "openalex_id":
+                column_configs[column] = st.column_config.LinkColumn(
+                    "OpenAlex ID",
+                    help="Open the work in OpenAlex",
+                    display_text=r"(?:https?://openalex\.org/)?(.+)",
+                )
+            elif column.lower() == "doi":
+                column_configs[column] = st.column_config.LinkColumn(
+                    "DOI",
+                    help="Open this DOI in a new tab",
+                    display_text=r"(?:https?://(?:dx\.)?doi\.org/)?(.+)",
+                )
+            else:
+                column_configs[column] = st.column_config.TextColumn(column.replace("_", " ").title())
+        st.data_editor(
+            preview_df,
+            hide_index=True,
+            disabled=True,
+            height=table_height,
+            use_container_width=True,
+            column_config=column_configs,
+        )
+        st.caption(f"Showing page {current_page} of {total_pages}.")
+        si_state = st.session_state.get("preview_focus_index")
+        default_f = 0 if si_state is None else min(si_state + 1, total_rows)
+        fr = st.slider(
+            "Focus publication for charts (0 = all)",
+            min_value=0,
+            max_value=max(0, total_rows),
+            value=default_f,
+            key=f"focus_pub_tr{total_rows}",
+            help="Restrict some charts to one row, or 0 for the full result set.",
+        )
+        selected_index = int(fr) - 1 if fr > 0 else None
+        st.session_state["preview_focus_index"] = selected_index
+        if selected_index is not None and 0 <= selected_index < len(all_rows):
+            peek = all_rows[selected_index]
+            raw_t = peek.get("title") or peek.get("display_name") or ""
+            if raw_t:
+                st.caption(f"Focused row: {raw_t[:160]}{'…' if len(raw_t) > 160 else ''}")
+
+        if selected_index is not None and 0 <= selected_index < len(all_rows):
+            chart_rows = [all_rows[selected_index]]
+            row_info = all_rows[selected_index]
+            author_info = abbreviate_authors(row_info.get("authors") or "")
+            title_info = row_info.get("title") or row_info.get("display_name") or "(no title)"
+            if author_info:
+                selected_title = f"{author_info}, {title_info}"
+            else:
+                selected_title = title_info
+        else:
+            chart_rows = all_rows
+            selected_index = None
+            selected_title = None
+        st.caption("Use the slider above: **0** = all publications for the charts.")
+    else:
+        st.session_state["preview_page"] = 1
+        st.info("No preview rows available.")
+
+    chart_data = aggregate_sdg_counts(chart_rows)
+    st.write("")
+    st.subheader("SDG distribution", divider="red")
+    chart_title = "selected publication" if len(chart_rows) == 1 else "all publications"
+    if chart_title == "selected publication" and selected_title:
+        chart_title = f"selected publication ({selected_title})"
+    render_sdg_pie_chart(chart_data, f"SDGs in {chart_title}")
+    st.write("")
+    st.subheader("Co-affiliation network", divider="violet")
+    network_center_id = result_institution_id if result_mode == "institution" else None
+    render_institution_network(chart_rows, from_date_str, to_date_str, network_center_id)
+    st.write("")
+    st.subheader("OA distribution by author", divider="blue")
+    render_author_oa_chart(all_rows, from_date_str, to_date_str)
+    st.write("")
+    st.subheader("Open Access - cosed access ratio", divider="green")
+    render_oa_ring_chart(chart_rows)
+    st.write("")
+    st.subheader("Publication volume by OA status", divider="grey")
+    render_oa_status_chart(all_rows, from_date_str, to_date_str)
+    st.write("")
+    st.subheader("Publication types in selected period", divider="orange")
+    render_publication_type_chart(all_rows, from_date_str, to_date_str)
+    
+    st.write("")
+    st.divider()
+    st.header("Download data set", divider="rainbow")
+    st.info("Donwload the full data set as Excel or CSV for further analysis using [OpenRefine](https://openrefine.org) or other tools.", icon=":material/file_download:")
+    export_rows = rows or all_rows
+    excel_bytes = rows_to_excel_bytes(export_rows, CSV_FIELDNAMES) if export_rows else None
+    if excel_bytes:
+        st.download_button(
+            "Download Excel",
+            data=excel_bytes,
+            file_name=filename.replace(".csv", ".xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name=filename,
+        mime="text/csv",
+    )
+
+
+if __name__ == "__main__":
+    main()

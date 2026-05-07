@@ -1,0 +1,155 @@
+# Aurora SDG Publication Classifier
+
+This Streamlit app helps you explore publications from the OpenAlex database for any institution (with or without a ROR entry). It pulls the metadata, enriches missing abstracts, runs them through Aurora’s Sustainable Development Goals (SDG) classifiers, and gives you immediate visual and downloadable results.
+
+## What you can do
+
+- **Search institutions**: Search the OpenAlex institution registry and pick a match, or paste a ROR/OpenAlex institution URL (e.g. `https://ror.org/02msan859` or `https://openalex.org/I123456789`).
+- **Set filters**: Choose publication types, SDG classifier models, time windows, and optional record limits.
+- **Fetch SDG predictions**: The app calls OpenAlex for metadata and Aurora for SDG scores. Everything is cached locally in `cache.sqlite3` to avoid redundant network calls.
+- **Enrich Abstracts**: If an abstract is missing in OpenAlex, the app automatically performs a fallback search against Semantic Scholar and Google Scholar (via SerpApi) to find it.
+- **Inspect results instantly**: The “Preview” section shows 25 rows per page. You can select a single row to drive the SDG chart.
+- **Visualize SDG coverage**: A donut chart aggregates SDG scores across all rows or a single selected publication.
+- **Export data**: Download either a CSV or Excel file for the entire result set.
+
+## Screenshots
+
+![SDG classification results](image.png)
+SDG classification results with donut chart and data preview.
+
+![Co-affiliation network](image-1.png)
+Co-affiliation network visualization based on publication data.
+
+![OA status of publication volume](image-2.png)
+OA status of publication volume over time.
+
+## Demo
+A live demo is available at [Streamlit Cloud - Aurora SDG Publicaton Classifier](https://aurora-sdg-publication-classifier.streamlit.app). Note that the demo instance may have usage limits and could be slower due to shared resources.
+
+## High-level workflow
+
+```mermaid
+flowchart TB
+    A[User picks institution + options] --> B[Fetch OpenAlex works]
+    B --> C{Abstract available?}
+    C -->|Yes| D[Use abstract for SDG classification]
+    C -->|No| E{Cached abstract?}
+    E -->|Yes| D
+    E -->|No| F{Semantic Scholar via DOI}
+    F -->|Found| D
+    F -->|Missing| G{Google Scholar enabled?}
+    I -.->|Missing| H[Use title for SDG classification]
+    G -->|No| H
+    G -.->|Yes| I{Google Scholar via SerpApi or scholarly+proxies}
+    I -.->|Found| D
+    D --> J{SDG cached?}
+    H --> J
+    J -->|Cache valid| K[Reuse SDG results]
+    J -->|Needs run| L[Call Aurora classifier]
+    L --> M[Store SDG + abstract in cache]
+    K --> M
+    M --> N[Streamlit preview + charts]
+    N --> O[Download CSV/XLSX]
+```
+
+## How it works in the background
+
+1. **OpenAlex fetch**: We request the Works API using your selected institution (OpenAlex ID or ROR), date range, and publication type. The request uses a friendly User-Agent (set via `.streamlit/secrets.toml`) to comply with API guidelines.
+2. **Caching**: Each returned record and SDG classification is stored in a local SQLite database (`cache.sqlite3`). When you rerun the query, previously fetched publications are loaded from the cache, so the Aurora SDG API is only contacted for new or uncached works.
+3. **SDG classification**: Depending on the model you pick, abstracts or titles are sent to the relevant Aurora endpoint. Short abstracts are skipped when the model requires a minimum length (e.g., the OSDG model).
+4. **Abstract enrichment**: If OpenAlex provides no abstract, we reuse any cached text, otherwise we perform a series of fallbacks:
+    - **Semantic Scholar**: Called via its official API using the paper's DOI. Requires an optional API key.
+    - **Google Scholar**: Uses [SerpApi](https://serpapi.com/) when a key is provided; otherwise falls back to `scholarly` with free proxies (less reliable).
+5. **Exports**: A custom lightweight Excel writer assembles `.xlsx` files without additional libraries, ensuring easy downloads.
+
+## Getting started
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/jmiba/ERUA-publications.git
+   cd ERUA-publications
+   ```
+2. **Create a virtual environment (recommended)**
+
+    Mac OS/Linux:
+    ```bash
+    python3 -m venv .venv
+    # Activate it on macOS/Linux:
+    source .venv/bin/activate
+    ```
+    Windows (PowerShell):
+    ```bash
+    python3 -m venv .venv
+    # Activate it on Windows (PowerShell):
+    .\.venv\Scripts\Activate.ps1
+    ```
+3. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. **Configure secrets**: Use either `.streamlit/secrets.toml` or `.env` (copy from `.env.example`). See the sections below for details.
+5. **Run the app**:
+   ```bash
+   streamlit run app.py
+   ```
+6. **Use the interface**: Search for an institution, choose your options, and press “Fetch works and build CSV.” Progress bars will show the status.
+7. **Download your data**: After the fetch completes, you’ll see charts, a data preview, and buttons for Excel/CSV downloads.
+   - Without a SerpApi key, Google Scholar lookups rely on `scholarly` plus free proxies; this can be slower or less reliable than SerpApi.
+
+## Deploy to Railway
+
+This repo is ready for Railway with `railpack.json`:
+
+```json
+{
+  "$schema": "https://railpack.com/schema.json",
+  "startCommand": "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
+}
+```
+
+### Railway variables
+
+In Railway service **Variables**, set:
+
+- `HTTP_USER_AGENT` (required)
+- `SCOPUS_API_KEY` and `SCOPUS_INSTTOKEN` (required together for Scopus ID -> ORCID resolution and Elsevier abstract retrieval)
+- `SERPAPI_API_KEY` (optional)
+- `GOOGLE_SCHOLAR_ENABLED` (`true`/`false`, optional)
+- `DEFAULT_FROM_DATE` (`YYYY-MM-DD`, optional)
+
+Railway env vars map to the app the same way as `.env.example`.
+
+## Configuring secrets
+
+The app relies on Streamlit’s secrets mechanism. Create a `.streamlit/secrets.toml` file with entries like:
+
+```toml
+# A descriptive User-Agent string, including a contact email, is required for OpenAlex politeness.
+http_user_agent = "OpenAlex+Aurora SDG fetcher (mailto:you@example.com)"
+
+# Elsevier Scopus API: abstract retrieval (by DOI) and author retrieval (Scopus author id -> ORCID).
+# Both are required for those features. https://dev.elsevier.com/
+scopus_api_key = "YOUR_ELSEVIER_SCOPUS_API_KEY"
+scopus_insttoken = "YOUR_ELSEVIER_INSTTOKEN"
+
+# Enable Google Scholar abstract fetching. With a SerpApi key we'll use SerpApi; without it
+# we fall back to scholarly + free proxies (less reliable).
+# See: https://serpapi.com/ and https://github.com/scholarly-python-package/scholarly
+google_scholar_enabled = true
+serpapi_api_key = "YOUR_SERPAPI_API_KEY"
+
+
+[advanced_options]
+# Sets the default start of the publication date slider, e.g., "2020-01-01".
+default_from_date = "2020-01-01"
+```
+- `http_user_agent` is required.
+- `scopus_api_key` and `scopus_insttoken` are required together for Scopus author ID resolution.
+- `serpapi_api_key` is optional (without it, Google Scholar fallback uses `scholarly` free proxies).
+- `google_scholar_enabled` controls the final fallback to Google Scholar.
+
+A sample file is included at `.streamlit/secrets.sample.toml`.
+
+---
+
+Enjoy exploring how your institution’s publications map to the Sustainable Development Goals!
