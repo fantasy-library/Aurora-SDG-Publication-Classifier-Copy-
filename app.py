@@ -1415,14 +1415,16 @@ def render_publication_type_selector() -> Optional[str]:
     if st.session_state.get("_pub_type_choice") not in pub_options:
         st.session_state["_pub_type_choice"] = default_choice
 
-    choice = st.selectbox(
-        "Publication type filter",
-        options=pub_options,
-        key="_pub_type_choice",
-        help="Restrict OpenAlex works to one type, or All.",
-    )
-    choice = str(choice)
-    st.caption(f"**Active filter:** `{choice}`")
+    with st.container(border=True):
+        st.caption("Click the field below to **open the list** and pick one publication type.")
+        choice = st.selectbox(
+            "Publication type",
+            options=pub_options,
+            key="_pub_type_choice",
+            help="Restrict OpenAlex works to one type, or All.",
+        )
+        choice = str(choice)
+        st.caption(f"**Active filter:** `{choice}`")
 
     return None if choice == "All" else choice
 
@@ -1445,13 +1447,15 @@ def render_model_selector() -> str:
     elif st.session_state["_sdg_model_id"] not in valid_set:
         st.session_state["_sdg_model_id"] = default_name
 
-    model_id = st.selectbox(
-        "Classifier model",
-        options=valid_ids,
-        format_func=_sdg_model_label,
-        key="_sdg_model_id",
-        help="Which SDG scoring endpoint to use for each work.",
-    )
+    with st.container(border=True):
+        st.caption("Click the field below to **open the list** and pick which SDG model to use.")
+        model_id = st.selectbox(
+            "SDG classifier model",
+            options=valid_ids,
+            format_func=_sdg_model_label,
+            key="_sdg_model_id",
+            help="Which SDG scoring endpoint to use for each work.",
+        )
     return str(model_id)
 
 
