@@ -1179,6 +1179,8 @@ def _purge_legacy_streamlit_widget_keys() -> None:
         "institution_choice",
         "adv_period_start_ix",
         "adv_period_end_ix",
+        "adv_period_start_label",
+        "adv_period_end_label",
     ):
         st.session_state.pop(k, None)
 
@@ -1495,39 +1497,33 @@ def render_advanced_options(
 
     st.markdown("**Publication dates (OpenAlex filter)**")
     st.caption(
-        "Use **From month** and **Through month** to narrow which works OpenAlex returns, using each work’s "
+        "Use the **month-range line** to narrow which works OpenAlex returns, using each work’s "
         "**publication_date** and the API filters `from_publication_date` / `to_publication_date` "
-        "(month starts as YYYY-MM-01). Pick real month names from the lists—no numeric indexes."
+        "(month starts as YYYY-MM-01). Drag left/right handles to set start and end months."
     )
-    if "adv_period_start_label" not in st.session_state:
-        st.session_state["adv_period_start_label"] = start_label_default
-    if "adv_period_end_label" not in st.session_state:
-        st.session_state["adv_period_end_label"] = end_label_default
-    if st.session_state["adv_period_start_label"] not in labels:
-        st.session_state["adv_period_start_label"] = start_label_default
-    if st.session_state["adv_period_end_label"] not in labels:
-        st.session_state["adv_period_end_label"] = end_label_default
+    default_range = (start_label_default, end_label_default)
+    if "adv_period_range_labels" not in st.session_state:
+        st.session_state["adv_period_range_labels"] = default_range
+    else:
+        raw_range = st.session_state.get("adv_period_range_labels")
+        valid_range = (
+            isinstance(raw_range, tuple)
+            and len(raw_range) == 2
+            and raw_range[0] in labels
+            and raw_range[1] in labels
+        )
+        if not valid_range:
+            st.session_state["adv_period_range_labels"] = default_range
 
-    col_from, col_through = st.columns(2)
-    with col_from:
-        start_label = st.selectbox(
-            "From month (start of range)",
-            options=labels,
-            key="adv_period_start_label",
-            help="Earliest publication month to include.",
-        )
-    with col_through:
-        end_label = st.selectbox(
-            "Through month (end of range)",
-            options=labels,
-            key="adv_period_end_label",
-            help="Latest publication month to include.",
-        )
+    start_label, end_label = st.select_slider(
+        "Publication period (month range)",
+        options=labels,
+        value=st.session_state["adv_period_range_labels"],
+        key="adv_period_range_labels",
+        help="Drag both handles to pick the start and end publication month.",
+    )
     si = labels.index(start_label)
     ei = labels.index(end_label)
-    if si > ei:
-        si, ei = ei, si
-        st.info("Start month was after end month—the range was swapped to apply **earliest → latest**.")
     from_date = months[si]
     to_date = months[ei]
     st.markdown(
