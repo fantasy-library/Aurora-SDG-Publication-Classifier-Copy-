@@ -1,4 +1,4 @@
-# Aurora SDG Publication Classifier
+# SDG Publication and Open access status summary
 
 This Streamlit app helps you explore publications from the OpenAlex database for any institution (with or without a ROR entry). It pulls the metadata, enriches missing abstracts, runs them through Aurora’s Sustainable Development Goals (SDG) classifiers, and gives you immediate visual and downloadable results.
 

@@ -257,7 +257,8 @@ def resolve_author_openalex_id(
 
     **Numeric Scopus ID + Elsevier credentials** (``scopus_api_key`` / ``scopus_insttoken``):
     ``Scopus → Elsevier Author Retrieval (ORCID) → OpenAlex authors (filter=orcid) →``
-    downstream Works use ``author.id:A…``. No ``filter=scopus`` shortcut on this path.
+    downstream Works use ``author.id:A…``. If Elsevier returns no ORCID, falls back to
+    OpenAlex ``filter=scopus:…`` (same as the no-credentials path).
 
     **Numeric Scopus ID without Elsevier**: OpenAlex ``filter=scopus:…`` only (often empty).
 
@@ -307,32 +308,23 @@ def resolve_author_openalex_id(
             orcid_sv = fetch_orcid_from_elsevier_author(
                 sid, scopus_api_key, inst, session=sess, timeout=30
             )
-            if not orcid_sv:
-                return (
-                    None,
-                    None,
-                    "Elsevier Author API returned no ORCID for this Scopus ID "
-                    "(check api key / insttoken, HTTPS access, profile ORCID field). "
-                    "This app does not use OpenAlex `filter=scopus` when Elsevier credentials "
-                    "are set—you need ORCID from Elsevier here.",
-                    None,
+            if orcid_sv:
+                aid, name, err = _openalex_resolve_by_orcid(sess, headers, orcid_sv)
+                if err:
+                    return None, None, err, None
+                if not aid:
+                    return (
+                        None,
+                        None,
+                        f"ORCID {orcid_sv} from Scopus {sid} is not mapped to an OpenAlex author.",
+                        None,
+                    )
+                note = (
+                    f"1. Scopus ID `{sid}` → **Elsevier** Author API → ORCID `{orcid_sv}`  \n"
+                    f"2. ORCID → **OpenAlex** author `{aid}` (`filter=orcid`)  \n"
+                    f"3. Publication fetch → Works API `filter=author.id:{aid}`"
                 )
-            aid, name, err = _openalex_resolve_by_orcid(sess, headers, orcid_sv)
-            if err:
-                return None, None, err, None
-            if not aid:
-                return (
-                    None,
-                    None,
-                    f"ORCID {orcid_sv} from Scopus {sid} is not mapped to an OpenAlex author.",
-                    None,
-                )
-            note = (
-                f"1. Scopus ID `{sid}` → **Elsevier** Author API → ORCID `{orcid_sv}`  \n"
-                f"2. ORCID → **OpenAlex** author `{aid}` (`filter=orcid`)  \n"
-                f"3. Publication fetch → Works API `filter=author.id:{aid}`"
-            )
-            return aid, name, "", note
+                return aid, name, "", note
 
         try:
             resp = sess.get(
@@ -344,6 +336,16 @@ def resolve_author_openalex_id(
             resp.raise_for_status()
             results = resp.json().get("results") or []
             if not results:
+                if have_elsevier:
+                    return (
+                        None,
+                        None,
+                        "Elsevier Author API returned no ORCID for this Scopus author profile, "
+                        "and OpenAlex has no author indexed with `filter=scopus:"
+                        f"{sid}`. Check api key / insttoken and HTTPS access; add ORCID to the "
+                        "Scopus profile if missing; or paste an OpenAlex author URL / ORCID.",
+                        None,
+                    )
                 return (
                     None,
                     None,
@@ -371,12 +373,17 @@ def resolve_author_openalex_id(
             if not aid:
                 return None, None, "OpenAlex returned an author without an id.", None
             name = (rec.get("display_name") or "").strip() or None
-            return (
-                aid,
-                name,
-                "",
-                f"Matched via OpenAlex `filter=scopus:{sid}` (Elsevier/ORCID step skipped—no credentials). Works use `filter=author.id:{aid}`.",
-            )
+            if have_elsevier:
+                note = (
+                    f"Elsevier had no ORCID for Scopus `{sid}`; matched via OpenAlex "
+                    f"`filter=scopus:{sid}`. Works use `filter=author.id:{aid}`."
+                )
+            else:
+                note = (
+                    f"Matched via OpenAlex `filter=scopus:{sid}` (Elsevier/ORCID step skipped—no credentials). "
+                    f"Works use `filter=author.id:{aid}`."
+                )
+            return aid, name, "", note
         except requests.RequestException as exc:
             return None, None, f"Scopus author lookup failed: {exc}", None
 

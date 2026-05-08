@@ -1177,6 +1177,8 @@ def _purge_legacy_streamlit_widget_keys() -> None:
         "sdg_query_target",
         "institution_match_select",
         "institution_choice",
+        "adv_period_start_ix",
+        "adv_period_end_ix",
     ):
         st.session_state.pop(k, None)
 
@@ -1218,8 +1220,9 @@ def render_author_selector(
     """
     Resolve ORCID, OpenAlex author URL/id, or Scopus author ID.
 
-    With Elsevier credentials, numeric Scopus IDs follow: **Scopus → Elsevier (ORCID) → OpenAlex**
-    by ORCID, then publications use **`author.id`** on the Works API.
+    With Elsevier credentials, numeric Scopus IDs try **Scopus → Elsevier (ORCID) → OpenAlex**
+    by ORCID; if Elsevier has no ORCID on file, the same **OpenAlex `filter=scopus`** lookup
+    runs as without keys. Publications use **`author.id`** on the Works API.
 
     Returns (author_openalex_token, display_name).
     """
@@ -1229,9 +1232,9 @@ def render_author_selector(
         "Paste an ORCID (URL or 0000-0001-2345-6789), an OpenAlex author URL "
         "(https://openalex.org/A…), or a numeric Scopus author ID, then click **Resolve author**."
         + (
-            " **Scopus IDs:** Elsevier reads ORCID from the Scopus author profile, "
-            "then OpenAlex resolves the author by that ORCID; works query `author.id`."
-            " Same **scopus_api_key** / **scopus_insttoken** as abstracts."
+            " **Scopus IDs:** Elsevier reads ORCID from the Scopus author profile when present; "
+            "otherwise OpenAlex `filter=scopus` is used. Same **scopus_api_key** / "
+            "**scopus_insttoken** as abstracts."
             if _have_els
             else " **Scopus IDs without Elsevier keys:** only OpenAlex `filter=scopus` "
             "(often empty); prefer adding **scopus_api_key** + **scopus_insttoken** for ORCID-based resolution."
@@ -1265,7 +1268,7 @@ def render_author_selector(
             st.session_state.pop("author_resolve_note", None)
         else:
             spinner_msg = (
-                "Scopus ID → Elsevier (ORCID) → OpenAlex…"
+                "Scopus ID → Elsevier (ORCID), then OpenAlex if needed…"
                 if looks_like_scopus_author_id(raw) and scopus_api_key and (scopus_insttoken or "").strip()
                 else "Looking up author…"
             )
@@ -1389,7 +1392,7 @@ def render_institution_selector(user_agent: str) -> Tuple[Optional[str], bool]:
     
 
 def render_publication_type_selector() -> Optional[str]:
-    """Pick OpenAlex work type using buttons (avoids selectbox + URL sync deserialization bugs)."""
+    """Pick OpenAlex work type from a dropdown."""
     st.subheader("2. Publication type", divider="blue")
     types = [
         "article",
@@ -1411,46 +1414,45 @@ def render_publication_type_selector() -> Optional[str]:
     default_choice = pub_options[0]
     if st.session_state.get("_pub_type_choice") not in pub_options:
         st.session_state["_pub_type_choice"] = default_choice
-    choice = str(st.session_state["_pub_type_choice"])
-    st.markdown(f"**Active filter:** `{choice}`")
 
-    ncols = 4
-    for r in range((len(pub_options) + ncols - 1) // ncols):
-        cols = st.columns(ncols)
-        for c in range(ncols):
-            ix = r * ncols + c
-            if ix >= len(pub_options):
-                break
-            opt = pub_options[ix]
-            short = opt if len(opt) <= 22 else f"{opt[:20]}…"
-            with cols[c]:
-                if st.button(short, key=f"pubtype_btn_{ix}"):
-                    st.session_state["_pub_type_choice"] = opt
-                    st.rerun()
+    choice = st.selectbox(
+        "Publication type filter",
+        options=pub_options,
+        key="_pub_type_choice",
+        help="Restrict OpenAlex works to one type, or All.",
+    )
+    choice = str(choice)
+    st.caption(f"**Active filter:** `{choice}`")
 
     return None if choice == "All" else choice
 
 
+def _sdg_model_label(model_id: str) -> str:
+    for mid, desc in AURORA_MODELS:
+        if mid == model_id:
+            return desc
+    return model_id
+
+
 def render_model_selector() -> str:
-    """Pick SDG model via buttons (avoids selectbox deserialize issues)."""
+    """Pick SDG model from a dropdown."""
     st.subheader("3. SDG classifier", divider="green")
     default_name = next((n for n, _ in AURORA_MODELS if n == "aurora-sdg-multi"), AURORA_MODELS[0][0])
-    valid_ids = {n for n, _ in AURORA_MODELS}
+    valid_ids = [n for n, _ in AURORA_MODELS]
+    valid_set = set(valid_ids)
     if "_sdg_model_id" not in st.session_state:
         st.session_state["_sdg_model_id"] = default_name
-    elif st.session_state["_sdg_model_id"] not in valid_ids:
+    elif st.session_state["_sdg_model_id"] not in valid_set:
         st.session_state["_sdg_model_id"] = default_name
-    current_id = str(st.session_state["_sdg_model_id"])
 
-    for model_id, desc in AURORA_MODELS:
-        pressed = st.button(
-            f"{'◉ ' if model_id == current_id else '○ '}{desc}",
-            key=f"model_pick_{model_id}",
-        )
-        if pressed:
-            st.session_state["_sdg_model_id"] = model_id
-            st.rerun()
-    return current_id
+    model_id = st.selectbox(
+        "Classifier model",
+        options=valid_ids,
+        format_func=_sdg_model_label,
+        key="_sdg_model_id",
+        help="Which SDG scoring endpoint to use for each work.",
+    )
+    return str(model_id)
 
 
 def render_advanced_options(
@@ -1484,36 +1486,59 @@ def render_advanced_options(
     ei_default = len(months) - 1
 
     max_ix = len(months) - 1
-    si = st.slider(
-        "Publication period — start (month)",
-        min_value=0,
-        max_value=max_ix,
-        value=min(si_default, max_ix),
-        key="adv_period_start_ix",
-        help="First month included in the OpenAlex date filter.",
+    start_label_default = labels[min(si_default, max_ix)]
+    end_label_default = labels[min(ei_default, max_ix)]
+
+    st.markdown("**Publication dates (OpenAlex filter)**")
+    st.caption(
+        "Use **From month** and **Through month** to narrow which works OpenAlex returns, using each work’s "
+        "**publication_date** and the API filters `from_publication_date` / `to_publication_date` "
+        "(month starts as YYYY-MM-01). Pick real month names from the lists—no numeric indexes."
     )
-    ei = st.slider(
-        "Publication period — end (month)",
-        min_value=0,
-        max_value=max_ix,
-        value=min(ei_default, max_ix),
-        key="adv_period_end_ix",
-        help="Last month included.",
-    )
+    if "adv_period_start_label" not in st.session_state:
+        st.session_state["adv_period_start_label"] = start_label_default
+    if "adv_period_end_label" not in st.session_state:
+        st.session_state["adv_period_end_label"] = end_label_default
+    if st.session_state["adv_period_start_label"] not in labels:
+        st.session_state["adv_period_start_label"] = start_label_default
+    if st.session_state["adv_period_end_label"] not in labels:
+        st.session_state["adv_period_end_label"] = end_label_default
+
+    col_from, col_through = st.columns(2)
+    with col_from:
+        start_label = st.selectbox(
+            "From month (start of range)",
+            options=labels,
+            key="adv_period_start_label",
+            help="Earliest publication month to include.",
+        )
+    with col_through:
+        end_label = st.selectbox(
+            "Through month (end of range)",
+            options=labels,
+            key="adv_period_end_label",
+            help="Latest publication month to include.",
+        )
+    si = labels.index(start_label)
+    ei = labels.index(end_label)
     if si > ei:
         si, ei = ei, si
+        st.info("Start month was after end month—the range was swapped to apply **earliest → latest**.")
     from_date = months[si]
     to_date = months[ei]
-    st.caption(
-        f"Including works published from **{labels[si]}** through **{labels[ei]}** "
-        f"({from_date:%Y-%m-%d} … {to_date:%Y-%m-%d})."
+    st.markdown(
+        f"**Applied publication window:** **{labels[si]}** → **{labels[ei]}** · "
+        f"`from_publication_date={from_date:%Y-%m-%d}` · `to_publication_date={to_date:%Y-%m-%d}`"
     )
+
+    st.divider()
+    st.markdown("**Fetch size (optional)**")
     limit_value = st.number_input(
-        "Limit to first N records (0 = no limit)",
+        "Max works to fetch this run (0 = no limit)",
         min_value=0,
         value=0,
         step=50,
-        help="Use to test the workflow without downloading everything.",
+        help="Separate from dates: caps how many records are processed after the date filter, useful for quick tests.",
     )
     if not scopus_key_from_secret or not scopus_insttoken_from_secret:
         st.info(
@@ -1540,11 +1565,11 @@ def _reset_fetch_state(
 
 def main():
     """Streamlit entry point that wires all widgets, fetch flow, and previews."""
-    st.set_page_config(page_title="Aurora SDG Publication Classifier", layout="wide")
+    st.set_page_config(page_title="SDG Publication and Open access status summary", layout="wide")
     _strip_browser_query_params()
     _purge_legacy_streamlit_widget_keys()
 
-    st.title("Aurora SDG Publication Classifier")
+    st.title("SDG Publication and Open access status summary")
     st.caption(
         "Fetch publications for an **institution** or an **author**, relate them to the 17 UN Sustainable "
         "Development Goals (SDGs) using the [Aurora SDG classifier](https://aurora-universities.eu/sdg-research/classify/), "
