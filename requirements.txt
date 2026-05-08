@@ -9,3 +9,4 @@ httpx<0.28.0  # Temporary fix for compatibility issues with scholarly proxy setu
 free-proxy==1.0.6  # Scholarly FreeProxies expects older API
 networkx>=3.0
 plotly>=5.22
+tomli>=2.0.1; python_version < "3.11"

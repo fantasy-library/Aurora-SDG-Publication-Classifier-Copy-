@@ -98,14 +98,7 @@ flowchart TB
 
 ## Deploy to Railway
 
-This repo is ready for Railway with `railpack.json`:
-
-```json
-{
-  "$schema": "https://railpack.com/schema.json",
-  "startCommand": "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
-}
-```
+This repo ships **`railway.json`** (deploy + health check) and **`railpack.json`** (Railpack `deploy.startCommand`). The start command must listen on **`$PORT`** and **`0.0.0.0`**; Streamlit has no `/health` route, so the health check must target **`/`** (already set in `railway.json`). If the dashboard still uses `/health` or a fixed port like `8501`, Railway will show “Application failed to respond” or 502.
 
 ### Railway variables
 

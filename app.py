@@ -18,7 +18,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib
 
 from openalex_sdg import (
     AURORA_MODELS,
