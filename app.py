@@ -545,10 +545,9 @@ def render_institution_network(
         return
 
     st.caption(
-        "Each **node** is an institution (from affiliation metadata on each row: OpenAlex authorships, or "
-        "Scopus search ``<affiliation>`` blocks with stable synthetic ids). An **edge** means two institutions "
-        "appeared together on at least one publication. Scopus search often lists only a subset of affiliations "
-        "compared to a full author profile, so graphs can look sparser than OpenAlex for the same person. "
+        "Each **node** is an institution (from OpenAlex authorship affiliations on each row). An **edge** means "
+        "two institutions appeared together on at least one publication. When works were discovered via "
+        "Scopus AU-ID, rows are still filled from OpenAlex by DOI, so this view matches a direct OpenAlex fetch. "
         "**Link-strength** on a node sums edge weights to partners (not the same as publication count—see hover "
         "**publications in this view**)."
     )
@@ -1225,10 +1224,11 @@ def render_author_publication_source_selector(
     scopus_insttoken: Optional[str],
 ) -> str:
     """
-    Choose whether author works are listed from OpenAlex or from Elsevier Scopus Search (``AU-ID``).
+    Choose whether author works are listed from OpenAlex or discovered via Scopus (``AU-ID``) then OpenAlex.
 
-    Scopus mode uses ``scopus_api_key`` / ``scopus_insttoken`` on the search endpoint; OA columns
-    follow Scopus metadata; SDG scores still use the Aurora API.
+    Scopus mode lists DOIs from Elsevier Scopus Search, then loads each work from OpenAlex by DOI so
+    charts and the co-affiliation network match a normal OpenAlex fetch. ``citedby_count`` still comes
+    from the Scopus search XML when present.
     """
     st.markdown("**Publication list source**")
     have_elsevier = bool(scopus_api_key and (scopus_insttoken or "").strip())
@@ -1249,8 +1249,8 @@ def render_author_publication_source_selector(
             else "Scopus Search (AU-ID)"
         ),
         help=(
-            "OpenAlex: `filter=author.id:…`. Scopus: Elsevier `…/search/scopus?query=AU-ID(…)` "
-            "with your institutional token; open access fields come from Scopus."
+            "OpenAlex: Works API `filter=author.id:…`. Scopus: Search API `AU-ID(…)` to collect DOIs, "
+            "then each work is loaded from OpenAlex (same metadata as a direct OpenAlex run)."
         ),
     )
     src = str(choice)
@@ -1258,9 +1258,10 @@ def render_author_publication_source_selector(
         st.warning("Scopus Search requires both Elsevier **api key** and **insttoken**.")
     elif src == "scopus":
         st.caption(
-            "Uses Scopus **openaccess** / **freetoread** fields for OA columns. "
-            "SDG labels still use Aurora (no SDG field in Scopus search results). "
-            "Resolve a **numeric Scopus author ID**, or an OpenAlex author that includes a Scopus id."
+            "Scopus returns **DOIs** for your AU-ID query; each DOI is resolved in **OpenAlex** for "
+            "authors, OA status, types, and affiliations (charts and co-affiliation network). "
+            "**Cited-by** counts still come from Scopus search when available. "
+            "Resolve a **numeric Scopus author ID**, or an OpenAlex author with a linked Scopus id."
         )
     return src
 
@@ -1929,13 +1930,28 @@ def main():
         if google_scholar_enabled
         else "."
     )
-    st.success(
+    success_msg = (
         f"Wrote **{stats.total_processed:,}** rows. "
-        f"Abstracts available: **{stats.total_abstracts_available:,}**. " # New line
+        f"Abstracts available: **{stats.total_abstracts_available:,}**. "
         f"OpenAlex missing abstracts: **{stats.openalex_abstract_missing:,}**; "
-        f"retrieved from Scopus (Elsevier): **{stats.scopus_abstract_retrieved:,}**"
+        f"abstracts via Elsevier (DOI): **{stats.scopus_abstract_retrieved:,}**"
         f"{gs_note}"
     )
+    if result_author_pub_source == "scopus":
+        extras: List[str] = []
+        for label, attr in (
+            ("Scopus rows without DOI", "scopus_skipped_no_doi"),
+            ("duplicate DOI skipped", "scopus_skipped_duplicate_doi"),
+            ("DOI not found in OpenAlex", "scopus_doi_not_in_openalex"),
+            ("skipped (publication type)", "scopus_skipped_type_mismatch"),
+            ("skipped (publication date window)", "scopus_skipped_date_mismatch"),
+        ):
+            n = int(getattr(stats, attr, 0) or 0)
+            if n:
+                extras.append(f"{label}: **{n:,}**")
+        if extras:
+            success_msg += " · " + "; ".join(extras)
+    st.success(success_msg)
     if rows is None:
         try:
             csv_text = csv_bytes.decode("utf-8")
@@ -1997,18 +2013,11 @@ def main():
                     "#", help="Row number in this page", width="small"
                 )
             elif column == "openalex_id":
-                if result_author_pub_source == "scopus":
-                    column_configs[column] = st.column_config.LinkColumn(
-                        "Scopus / Elsevier record",
-                        help="Open the abstract record (Elsevier API or Scopus)",
-                        display_text=r"(?:https?://[^/]+/)?(.+)",
-                    )
-                else:
-                    column_configs[column] = st.column_config.LinkColumn(
-                        "OpenAlex ID",
-                        help="Open the work in OpenAlex",
-                        display_text=r"(?:https?://openalex\.org/)?(.+)",
-                    )
+                column_configs[column] = st.column_config.LinkColumn(
+                    "OpenAlex ID",
+                    help="Open the work in OpenAlex",
+                    display_text=r"(?:https?://openalex\.org/)?(.+)",
+                )
             elif column.lower() == "doi":
                 column_configs[column] = st.column_config.LinkColumn(
                     "DOI",

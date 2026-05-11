@@ -100,7 +100,13 @@ class FetchStats:
     openalex_abstract_missing: int
     scopus_abstract_retrieved: int
     gs_abstract_retrieved: int
-    total_abstracts_available: int = 0 # New field
+    total_abstracts_available: int = 0  # New field
+    # Scopus AU-ID → DOI → OpenAlex bridge (optional; default 0)
+    scopus_skipped_no_doi: int = 0
+    scopus_skipped_duplicate_doi: int = 0
+    scopus_doi_not_in_openalex: int = 0
+    scopus_skipped_type_mismatch: int = 0
+    scopus_skipped_date_mismatch: int = 0
 
 
 def too_short_for_model(model: str, text: str) -> bool:
@@ -1083,6 +1089,235 @@ def parse_scopus_search_xml_page(content: bytes) -> Tuple[Optional[int], List[ET
     return total, entries
 
 
+def normalize_doi_for_openalex(doi: str) -> str:
+    """Return bare DOI ``10…/…`` for building an OpenAlex work URL ``https://doi.org/…``."""
+    if not doi:
+        return ""
+    cleaned = doi.strip()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/", "doi:"):
+        if cleaned.lower().startswith(prefix.lower()):
+            cleaned = cleaned[len(prefix) :].strip()
+    return cleaned.strip()
+
+
+def fetch_openalex_work_by_doi(
+    doi: str,
+    session: requests.Session,
+    user_agent: str = DEFAULT_USER_AGENT,
+    timeout: float = 35,
+) -> Optional[dict]:
+    """GET a single OpenAlex work entity using its DOI (returns ``None`` if not found)."""
+    cleaned = normalize_doi_for_openalex(doi)
+    if not cleaned or "/" not in cleaned:
+        return None
+    work_url = "https://doi.org/" + cleaned
+    url = f"{BASE_WORKS}/{quote(work_url, safe='')}"
+    headers = {"User-Agent": user_agent}
+    try:
+        resp = session.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and data.get("id"):
+            return data
+        return None
+    except requests.RequestException:
+        return None
+
+
+def _openalex_work_in_publication_date_range(
+    work: dict, from_date: Optional[str], to_date: Optional[str]
+) -> bool:
+    """``True`` if ``publication_date`` is within ``[from_date, to_date]`` (YYYY-MM-DD strings)."""
+    pub = (work.get("publication_date") or "").strip()[:10]
+    if not pub:
+        return True
+    if from_date and pub and pub < (from_date or "")[:10]:
+        return False
+    if to_date and pub and pub > (to_date or "")[:10]:
+        return False
+    return True
+
+
+def _openalex_work_matches_type(work: dict, work_type: Optional[str]) -> bool:
+    if not work_type:
+        return True
+    return (work.get("type") or "").strip().lower() == work_type.strip().lower()
+
+
+def enrich_append_openalex_work(
+    work: dict,
+    *,
+    session: requests.Session,
+    stats: FetchStats,
+    rows: List[Dict[str, Any]],
+    model: str,
+    user_agent: str,
+    scopus_api_key: Optional[str],
+    scopus_insttoken: Optional[str],
+    enable_google_scholar: bool,
+    serpapi_api_key: Optional[str],
+    progress_callback: ProgressHook,
+    cancel_check: Optional[Callable[[], bool]],
+    citedby_count: Any = "",
+    raw_record_overlay: Optional[Dict[str, Any]] = None,
+    row_overlay: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Turn one OpenAlex ``work`` JSON object into a result row (abstract, SDG, cache) and append to ``rows``.
+
+    Shared by the OpenAlex Works cursor pipeline and the Scopus AU-ID → DOI → OpenAlex bridge.
+    """
+    if cancel_check and cancel_check():
+        raise FetchCancelled()
+
+    def emit_progress(message: str = "") -> None:
+        if cancel_check and cancel_check():
+            raise FetchCancelled()
+        if progress_callback:
+            progress_callback(stats.total_processed, stats.total_expected, message)
+
+    openalex_id = work.get("id", "")
+    title = work.get("display_name") or work.get("title") or ""
+    publication_date = work.get("publication_date") or ""
+    doi = work.get("doi") or ""
+    work_type_val = work.get("type") or ""
+    language = work.get("language") or ""
+    open_access = work.get("open_access") or {}
+    is_oa = open_access.get("is_oa")
+    oa_status = open_access.get("oa_status") or ""
+    authorships = work.get("authorships") or []
+    authors_str, insts_str, inst_affiliations = flatten_authors_and_institutions(authorships)
+
+    cached_work = get_cached_work(openalex_id) if openalex_id else None
+    cached_abstract = (cached_work or {}).get("abstract") or ""
+
+    abstract_text = reconstruct_abstract(work.get("abstract_inverted_index"))
+    authors_preview = abbreviate_authors(authors_str)
+    title_display = title if len(title) <= 120 else f"{title[:117]}..."
+    detail_label = title_display or openalex_id or "Untitled work"
+    if authors_preview:
+        detail_label = f"{authors_preview}, {detail_label}"
+    emit_progress(detail_label)
+
+    if not abstract_text:
+        stats.openalex_abstract_missing += 1
+        if cached_abstract:
+            abstract_text = cached_abstract
+        elif doi:
+            sc_abs = get_abstract_from_scopus(
+                doi,
+                session=session,
+                api_key=scopus_api_key,
+                insttoken=scopus_insttoken,
+            )
+            if sc_abs:
+                abstract_text = sc_abs
+                stats.scopus_abstract_retrieved += 1
+    if enable_google_scholar and not abstract_text:
+        if serpapi_api_key:
+            serpapi_abstract = get_abstract_from_serpapi_google_scholar(
+                title, authors_str, api_key=serpapi_api_key, session=session
+            )
+            if serpapi_abstract:
+                abstract_text = serpapi_abstract
+                stats.gs_abstract_retrieved += 1
+        else:
+            scholarly_abs = get_abstract_from_scholarly(title, authors_str)
+            if scholarly_abs:
+                abstract_text = scholarly_abs
+                stats.gs_abstract_retrieved += 1
+    clean_cached_abs = clean_html_fragment(cached_abstract)
+    abstract_text = clean_html_fragment(abstract_text)
+    abstract_updated = bool(abstract_text and abstract_text != clean_cached_abs)
+
+    if abstract_text:
+        stats.total_abstracts_available += 1
+
+    text_for_sdg = abstract_text if abstract_text else title
+    sdg_json: Optional[dict] = None
+    sdg_note = ""
+    sdg_formatted = ""
+    cached_sdg_entry: Optional[Dict[str, Any]] = None
+    reused_sdg = False
+
+    if model == "skip":
+        sdg_note = "skipped: user selected 'skip'"
+    else:
+        if model == "osdg" and too_short_for_model(model, text_for_sdg):
+            sdg_note = "skipped: osdg requires >=50 words"
+        else:
+            cached_sdg_entry = (
+                get_cached_sdg_result(openalex_id, model) if openalex_id else None
+            )
+            should_reuse_sdg = bool(cached_sdg_entry) and not abstract_updated
+            if should_reuse_sdg:
+                reused_sdg = True
+                raw_json = cached_sdg_entry.get("sdg_response") or ""
+                if raw_json:
+                    try:
+                        sdg_json = json.loads(raw_json)
+                    except json.JSONDecodeError:
+                        sdg_json = None
+                sdg_formatted = cached_sdg_entry.get("sdg_formatted") or ""
+                sdg_note = cached_sdg_entry.get("sdg_note") or ""
+                if not sdg_formatted and sdg_json:
+                    sdg_formatted = format_sdg_predictions(sdg_json)
+            else:
+                sdg_json, sdg_note = classify_text_aurora(
+                    model, text_for_sdg, session=session, user_agent=user_agent
+                )
+                sdg_formatted = (
+                    format_sdg_predictions(sdg_json) if sdg_json is not None else ""
+                )
+                upsert_sdg_result(
+                    openalex_id=openalex_id,
+                    model=model,
+                    sdg_response=sdg_json,
+                    sdg_formatted=sdg_formatted,
+                    sdg_note=sdg_note,
+                )
+                time.sleep(0.12)
+
+    sdg_raw_str = json.dumps(sdg_json, ensure_ascii=False) if sdg_json is not None else ""
+    if reused_sdg and not sdg_raw_str and cached_sdg_entry:
+        sdg_raw_str = cached_sdg_entry.get("sdg_response") or ""
+
+    row_data: Dict[str, Any] = {
+        "openalex_id": openalex_id,
+        "title": title,
+        "publication_date": publication_date,
+        "doi": doi,
+        "type": work_type_val,
+        "language": language,
+        "is_oa": is_oa,
+        "oa_status": oa_status,
+        "citedby_count": citedby_count if citedby_count is not None and citedby_count != "" else "",
+        "authors": authors_str,
+        "institutions": insts_str,
+        "institution_ids": "; ".join([aff.get("id", "") for aff in inst_affiliations if aff.get("id")]),
+        "institution_countries": "; ".join([aff.get("country", "") for aff in inst_affiliations]),
+        "institution_names_raw": "; ".join([aff.get("name", "") for aff in inst_affiliations]),
+        "institution_affiliations_json": json.dumps(inst_affiliations, ensure_ascii=False),
+        "abstract": abstract_text,
+        "sdg_model": model,
+        "sdg_response": sdg_raw_str,
+        "sdg_formatted": sdg_formatted,
+        "sdg_note": sdg_note,
+    }
+    if row_overlay:
+        row_data.update(row_overlay)
+
+    rows.append(row_data)
+    stats.total_processed += 1
+    raw_out: Dict[str, Any] = dict(work)
+    if raw_record_overlay:
+        raw_out.update(raw_record_overlay)
+    upsert_work(row_data, raw_record=raw_out)
+    emit_progress("")
+
+
 def fetch_author_publications_scopus_with_sdg(
     from_date: str,
     work_type: Optional[str],
@@ -1100,10 +1335,12 @@ def fetch_author_publications_scopus_with_sdg(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[Dict[str, object]], FetchStats]:
     """
-    List publications for one author via Elsevier Scopus Search (``AU-ID``), classify with Aurora.
+    Discover DOIs via Elsevier Scopus Search (``AU-ID``), then load each work from **OpenAlex by DOI**.
 
-    Open-access columns use Scopus metadata. SDG labels still come from the Aurora API (no SDG
-    field in Scopus search). Cache keys use ``scopus:eid:…`` pseudo-ids.
+    Rows match a normal OpenAlex fetch (authors, ``oa_status``, ``type``, authorship affiliations for
+    charts and the co-affiliation network). ``citedby_count`` is taken from Scopus ``<citedby-count>``
+    when present. Entries with no DOI, duplicate DOIs, no OpenAlex match, or type/date outside your
+    filters increment counters on ``FetchStats``.
     """
     if not scopus_api_key or not (scopus_insttoken or "").strip():
         raise ValueError(
@@ -1158,6 +1395,7 @@ def fetch_author_publications_scopus_with_sdg(
         start = 0
         page_size = 200
         total_reported: Optional[int] = None
+        seen_dois: Set[str] = set()
 
         while True:
             _ensure_not_cancelled()
@@ -1184,175 +1422,54 @@ def fetch_author_publications_scopus_with_sdg(
                 if limit_rows is not None and stats.total_processed >= limit_rows:
                     break
 
-                title = _scopus_entry_first_text(entry_el, "title")
-                creators = _scopus_entry_child_texts(entry_el, "creator")
-                authors_str = "; ".join(creators) if creators else ""
-                doi = _scopus_entry_first_text(entry_el, "doi")
-                pub_date = _scopus_entry_first_text(entry_el, "coverDate") or _scopus_entry_first_text(
-                    entry_el, "coverDisplayDate"
-                )
-                subtype = _scopus_entry_first_text(entry_el, "subtype")
-                subtype_desc = _scopus_entry_first_text(entry_el, "subtypeDescription")
-                work_type_val = subtype_desc or subtype or _scopus_entry_first_text(
-                    entry_el, "aggregationType"
-                )
+                doi_raw = _scopus_entry_first_text(entry_el, "doi")
+                doi_norm = normalize_doi_for_openalex(doi_raw)
+                if not doi_norm:
+                    stats.scopus_skipped_no_doi += 1
+                    continue
+                doi_key = doi_norm.lower()
+                if doi_key in seen_dois:
+                    stats.scopus_skipped_duplicate_doi += 1
+                    continue
+                seen_dois.add(doi_key)
+
+                work = fetch_openalex_work_by_doi(doi_norm, session, user_agent=user_agent)
+                if not work:
+                    stats.scopus_doi_not_in_openalex += 1
+                    continue
+                if not _openalex_work_matches_type(work, work_type):
+                    stats.scopus_skipped_type_mismatch += 1
+                    continue
+                if not _openalex_work_in_publication_date_range(work, from_date, to_date):
+                    stats.scopus_skipped_date_mismatch += 1
+                    continue
+
+                cited_n = _scopus_entry_citedby_count(entry_el)
                 eid = _scopus_entry_first_text(entry_el, "eid")
-                dc_id = _scopus_entry_first_text(entry_el, "identifier")
-                scopus_url = _scopus_entry_link_href(entry_el, "scopus")
-                self_href = _scopus_entry_link_href(entry_el, "self")
-                # Stable Elsevier record URL (matches OpenAlex-style ``id`` column usage in CSV/cache).
-                openalex_id = self_href or scopus_url or (
-                    f"https://api.elsevier.com/content/abstract/scopus_id/{eid.split('-')[-1]}"
-                    if eid and eid.startswith("2-s2.0-")
-                    else ""
-                )
-                if not openalex_id:
-                    openalex_id = dc_id or f"scopus:anonymous:{stats.total_processed}"
-
-                insts_str, inst_affiliations = _scopus_entry_affiliations_json(entry_el)
-                inst_ids_str = "; ".join(
-                    [a.get("id", "").strip() for a in inst_affiliations if (a.get("id") or "").strip()]
-                )
-                is_oa, oa_status = _scopus_entry_open_access(entry_el)
-
-                authors_preview = abbreviate_authors(authors_str)
-                title_display = title if len(title) <= 120 else f"{title[:117]}..."
-                detail_label = title_display or openalex_id
-                if authors_preview:
-                    detail_label = f"{authors_preview}, {detail_label}"
-                emit_progress(detail_label)
-
-                abstract_text = ""
-                cached_work = get_cached_work(openalex_id) if openalex_id else None
-                cached_abstract = (cached_work or {}).get("abstract") or ""
-                if not abstract_text and doi:
-                    sc_abs = get_abstract_from_scopus(
-                        doi,
-                        session=session,
-                        api_key=scopus_api_key,
-                        insttoken=scopus_insttoken,
-                    )
-                    if sc_abs:
-                        abstract_text = sc_abs
-                        stats.scopus_abstract_retrieved += 1
-                if not abstract_text:
-                    stats.openalex_abstract_missing += 1
-                    if cached_abstract:
-                        abstract_text = cached_abstract
-                if enable_google_scholar and not abstract_text:
-                    if serpapi_api_key:
-                        serpapi_abstract = get_abstract_from_serpapi_google_scholar(
-                            title, authors_str, api_key=serpapi_api_key, session=session
-                        )
-                        if serpapi_abstract:
-                            abstract_text = serpapi_abstract
-                            stats.gs_abstract_retrieved += 1
-                    else:
-                        scholarly_abs = get_abstract_from_scholarly(title, authors_str)
-                        if scholarly_abs:
-                            abstract_text = scholarly_abs
-                            stats.gs_abstract_retrieved += 1
-
-                clean_cached_abs = clean_html_fragment(cached_abstract)
-                abstract_text = clean_html_fragment(abstract_text)
-                abstract_updated = bool(abstract_text and abstract_text != clean_cached_abs)
-
-                if abstract_text:
-                    stats.total_abstracts_available += 1
-
-                text_for_sdg = abstract_text if abstract_text else title
-                sdg_json: Optional[dict] = None
-                sdg_note = ""
-                sdg_formatted = ""
-                cached_sdg_entry: Optional[Dict[str, Any]] = None
-                reused_sdg = False
-
-                citedby_count = _scopus_entry_citedby_count(entry_el)
-
-                raw_record = {
-                    "source": "scopus_search",
-                    "au_id": au_id,
-                    "eid": eid,
-                    "title": title,
-                    "doi": doi,
-                    "citedby_count": citedby_count,
+                overlay = {
+                    "_via_scopus_auid": True,
+                    "_scopus_au_id": au_id,
+                    "_scopus_eid": eid,
+                    "_scopus_search_doi": doi_raw.strip(),
                 }
-
-                if model == "skip":
-                    sdg_note = "skipped: user selected 'skip'"
-                else:
-                    if model == "osdg" and too_short_for_model(model, text_for_sdg):
-                        sdg_note = "skipped: osdg requires >=50 words"
-                    else:
-                        cached_sdg_entry = (
-                            get_cached_sdg_result(openalex_id, model) if openalex_id else None
-                        )
-                        should_reuse_sdg = bool(cached_sdg_entry) and not abstract_updated
-                        if should_reuse_sdg:
-                            reused_sdg = True
-                            raw_json = cached_sdg_entry.get("sdg_response") or ""
-                            if raw_json:
-                                try:
-                                    sdg_json = json.loads(raw_json)
-                                except json.JSONDecodeError:
-                                    sdg_json = None
-                            sdg_formatted = cached_sdg_entry.get("sdg_formatted") or ""
-                            sdg_note = cached_sdg_entry.get("sdg_note") or ""
-                            if not sdg_formatted and sdg_json:
-                                sdg_formatted = format_sdg_predictions(sdg_json)
-                        else:
-                            sdg_json, sdg_note = classify_text_aurora(
-                                model, text_for_sdg, session=session, user_agent=user_agent
-                            )
-                            sdg_formatted = (
-                                format_sdg_predictions(sdg_json) if sdg_json is not None else ""
-                            )
-                            upsert_sdg_result(
-                                openalex_id=openalex_id,
-                                model=model,
-                                sdg_response=sdg_json,
-                                sdg_formatted=sdg_formatted,
-                                sdg_note=sdg_note,
-                            )
-                            time.sleep(0.12)
-
-                sdg_raw_str = (
-                    json.dumps(sdg_json, ensure_ascii=False) if sdg_json is not None else ""
+                enrich_append_openalex_work(
+                    work,
+                    session=session,
+                    stats=stats,
+                    rows=rows,
+                    model=model,
+                    user_agent=user_agent,
+                    scopus_api_key=scopus_api_key,
+                    scopus_insttoken=scopus_insttoken,
+                    enable_google_scholar=enable_google_scholar,
+                    serpapi_api_key=serpapi_api_key,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    citedby_count=cited_n if cited_n is not None else "",
+                    raw_record_overlay=overlay,
+                    row_overlay={"data_source": "scopus_auid_then_openalex"},
                 )
-                if reused_sdg and not sdg_raw_str and cached_sdg_entry:
-                    sdg_raw_str = cached_sdg_entry.get("sdg_response") or ""
-
-                row_data: Dict[str, Any] = {
-                    "openalex_id": openalex_id,
-                    "title": title,
-                    "publication_date": pub_date,
-                    "doi": doi,
-                    "type": work_type_val,
-                    "language": "",
-                    "is_oa": is_oa,
-                    "oa_status": oa_status,
-                    "citedby_count": citedby_count if citedby_count is not None else "",
-                    "authors": authors_str,
-                    "institutions": insts_str,
-                    "institution_ids": inst_ids_str,
-                    "institution_countries": "; ".join(
-                        [a.get("country", "") for a in inst_affiliations if a.get("country")]
-                    ),
-                    "institution_names_raw": insts_str,
-                    "institution_affiliations_json": json.dumps(inst_affiliations, ensure_ascii=False),
-                    "abstract": abstract_text,
-                    "sdg_model": model,
-                    "sdg_response": sdg_raw_str,
-                    "sdg_formatted": sdg_formatted,
-                    "sdg_note": sdg_note,
-                    "data_source": "scopus",
-                    "scopus_eid": eid,
-                    "scopus_web_url": scopus_url or "",
-                }
-                rows.append(row_data)
-                stats.total_processed += 1
-                upsert_work(row_data, raw_record=raw_record)
-                emit_progress("")
+                time.sleep(0.06)
 
             if limit_rows is not None and stats.total_processed >= limit_rows:
                 break
@@ -1536,143 +1653,20 @@ def fetch_works_with_sdg(
 
         def process_record(work: dict) -> None:
             """Normalize/calculate every column for a single OpenAlex work."""
-            nonlocal session
-            _ensure_not_cancelled()
-            openalex_id = work.get("id", "")
-            title = work.get("display_name") or work.get("title") or ""
-            publication_date = work.get("publication_date") or ""
-            doi = work.get("doi") or ""
-            work_type_val = work.get("type") or ""
-            language = work.get("language") or ""
-            open_access = work.get("open_access") or {}
-            is_oa = open_access.get("is_oa")
-            oa_status = open_access.get("oa_status") or ""
-            authorships = work.get("authorships") or []
-            authors_str, insts_str, inst_affiliations = flatten_authors_and_institutions(authorships)
-
-            cached_work = get_cached_work(openalex_id) if openalex_id else None
-            cached_abstract = (cached_work or {}).get("abstract") or ""
-
-            abstract_text = reconstruct_abstract(work.get("abstract_inverted_index"))
-            abstract_updated = False
-            authors_preview = abbreviate_authors(authors_str)
-            title_display = title if len(title) <= 120 else f"{title[:117]}..."
-            detail_label = title_display or openalex_id or "Untitled work"
-            if authors_preview:
-                detail_label = f"{authors_preview}, {detail_label}"
-            emit_progress(detail_label)
-
-            if not abstract_text:
-                stats.openalex_abstract_missing += 1
-                if cached_abstract:
-                    abstract_text = cached_abstract
-                elif doi:
-                    sc_abs = get_abstract_from_scopus(
-                        doi,
-                        session=session,
-                        api_key=scopus_api_key,
-                        insttoken=scopus_insttoken,
-                    )
-                    if sc_abs:
-                        abstract_text = sc_abs
-                        stats.scopus_abstract_retrieved += 1
-            if enable_google_scholar and not abstract_text:
-                if serpapi_api_key:
-                    serpapi_abstract = get_abstract_from_serpapi_google_scholar(
-                        title, authors_str, api_key=serpapi_api_key, session=session
-                    )
-                    if serpapi_abstract:
-                        abstract_text = serpapi_abstract
-                        stats.gs_abstract_retrieved += 1
-                else:
-                    scholarly_abs = get_abstract_from_scholarly(title, authors_str)
-                    if scholarly_abs:
-                        abstract_text = scholarly_abs
-                        stats.gs_abstract_retrieved += 1
-            clean_cached_abs = clean_html_fragment(cached_abstract)
-            abstract_text = clean_html_fragment(abstract_text)
-            abstract_updated = bool(abstract_text and abstract_text != clean_cached_abs)
-
-            if abstract_text: # Increment if an abstract is available
-                stats.total_abstracts_available += 1
-
-            text_for_sdg = abstract_text if abstract_text else title
-            sdg_json: Optional[dict] = None
-            sdg_note = ""
-            sdg_formatted = ""
-            cached_sdg_entry: Optional[Dict[str, Any]] = None
-            reused_sdg = False
-
-            if model == "skip":
-                sdg_note = "skipped: user selected 'skip'"
-            else:
-                if model == "osdg" and too_short_for_model(model, text_for_sdg):
-                    sdg_note = "skipped: osdg requires >=50 words"
-                else:
-                    cached_sdg_entry = (
-                        get_cached_sdg_result(openalex_id, model) if openalex_id else None
-                    )
-                    should_reuse_sdg = bool(cached_sdg_entry) and not abstract_updated
-                    if should_reuse_sdg:
-                        reused_sdg = True
-                        raw_json = cached_sdg_entry.get("sdg_response") or ""
-                        if raw_json:
-                            try:
-                                sdg_json = json.loads(raw_json)
-                            except json.JSONDecodeError:
-                                sdg_json = None
-                        sdg_formatted = cached_sdg_entry.get("sdg_formatted") or ""
-                        sdg_note = cached_sdg_entry.get("sdg_note") or ""
-                        if not sdg_formatted and sdg_json:
-                            sdg_formatted = format_sdg_predictions(sdg_json)
-                    else:
-                        sdg_json, sdg_note = classify_text_aurora(
-                            model, text_for_sdg, session=session, user_agent=user_agent
-                        )
-                        sdg_formatted = (
-                            format_sdg_predictions(sdg_json) if sdg_json is not None else ""
-                        )
-                        upsert_sdg_result(
-                            openalex_id=openalex_id,
-                            model=model,
-                            sdg_response=sdg_json,
-                            sdg_formatted=sdg_formatted,
-                            sdg_note=sdg_note,
-                        )
-                        time.sleep(0.12)
-
-            sdg_raw_str = (
-                json.dumps(sdg_json, ensure_ascii=False) if sdg_json is not None else ""
+            enrich_append_openalex_work(
+                work,
+                session=session,
+                stats=stats,
+                rows=rows,
+                model=model,
+                user_agent=user_agent,
+                scopus_api_key=scopus_api_key,
+                scopus_insttoken=scopus_insttoken,
+                enable_google_scholar=enable_google_scholar,
+                serpapi_api_key=serpapi_api_key,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
             )
-            if reused_sdg and not sdg_raw_str and cached_sdg_entry:
-                sdg_raw_str = cached_sdg_entry.get("sdg_response") or ""
-
-            row_data = {
-                "openalex_id": openalex_id,
-                "title": title,
-                "publication_date": publication_date,
-                "doi": doi,
-                "type": work_type_val,
-                "language": language,
-                "is_oa": is_oa,
-                "oa_status": oa_status,
-                "citedby_count": "",
-                "authors": authors_str,
-                "institutions": insts_str,
-                "institution_ids": "; ".join([aff.get("id", "") for aff in inst_affiliations if aff.get("id")]),
-                "institution_countries": "; ".join([aff.get("country", "") for aff in inst_affiliations]),
-                "institution_names_raw": "; ".join([aff.get("name", "") for aff in inst_affiliations]),
-                "institution_affiliations_json": json.dumps(inst_affiliations, ensure_ascii=False),
-                "abstract": abstract_text,
-                "sdg_model": model,
-                "sdg_response": sdg_raw_str,
-                "sdg_formatted": sdg_formatted,
-                "sdg_note": sdg_note,
-            }
-            rows.append(row_data)
-            stats.total_processed += 1
-            upsert_work(row_data, raw_record=work)
-            emit_progress("")
 
         for work in results:
             _ensure_not_cancelled()
@@ -1718,6 +1712,9 @@ __all__ = [
     "extract_scopus_author_id_from_raw",
     "fetch_author_publications_scopus_with_sdg",
     "fetch_author_record",
+    "fetch_openalex_work_by_doi",
+    "enrich_append_openalex_work",
+    "normalize_doi_for_openalex",
     "fetch_institution_lineage",
     "ELSEVIER_ABSTRACT_BY_DOI",
     "ELSEVIER_AUTHOR_BY_ID",
