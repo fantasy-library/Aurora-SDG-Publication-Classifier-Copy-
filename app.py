@@ -28,6 +28,7 @@ from openalex_sdg import (
     DEFAULT_USER_AGENT,
     FetchCancelled,
     FetchStats,
+    fetch_author_publications_scopus_with_sdg,
     fetch_institution_lineage,
     fetch_works_with_sdg,
     is_ror_url,
@@ -107,6 +108,7 @@ PREVIEW_COLUMNS = [
     "publication_date",
     "type",
     "doi",
+    "citedby_count",
     "institutions",
 ]
 PREVIEW_PAGE_SIZE = 25
@@ -120,6 +122,7 @@ CSV_FIELDNAMES = [
     "language",
     "is_oa",
     "oa_status",
+    "citedby_count",
     "institutions",
     "institution_ids",
     "institution_countries",
@@ -1012,12 +1015,14 @@ def build_output_filename(
     from_date: str,
     to_date: Optional[str],
     limit_rows: Optional[int],
+    list_source: str = "openalex",
 ) -> str:
     """Generate a descriptive filename that encodes filters and limits."""
     tail = entity_slug.rstrip("/").split("/")[-1]
     type_part = wtype or "all"
     model_part = model if model != "skip" else "no-sdg"
-    fname = f"openalex_{tail}_{type_part}_{model_part}_{from_date}"
+    prefix = "scopus" if list_source == "scopus" else "openalex"
+    fname = f"{prefix}_{tail}_{type_part}_{model_part}_{from_date}"
     if to_date and to_date != from_date:
         fname += f"_to{to_date}"
     if limit_rows:
@@ -1212,6 +1217,51 @@ def render_query_target_via_buttons() -> str:
                 st.rerun()
     st.caption(f"Active: {'Institution search' if mode == 'institution' else 'Author search'}")
     return mode
+
+
+def render_author_publication_source_selector(
+    scopus_api_key: Optional[str],
+    scopus_insttoken: Optional[str],
+) -> str:
+    """
+    Choose whether author works are listed from OpenAlex or from Elsevier Scopus Search (``AU-ID``).
+
+    Scopus mode uses ``scopus_api_key`` / ``scopus_insttoken`` on the search endpoint; OA columns
+    follow Scopus metadata; SDG scores still use the Aurora API.
+    """
+    st.markdown("**Publication list source**")
+    have_elsevier = bool(scopus_api_key and (scopus_insttoken or "").strip())
+    if not have_elsevier:
+        st.caption(
+            "To enable **Scopus Search**, set non-empty **scopus_api_key** and **scopus_insttoken** "
+            "in `.streamlit/secrets.toml` (or `SCOPUS_API_KEY` / `SCOPUS_INSTTOKEN` in `.env`)."
+        )
+    choice = st.radio(
+        "Author works API",
+        options=("openalex", "scopus"),
+        index=0,
+        horizontal=True,
+        key="_author_pub_data_source",
+        format_func=lambda v: (
+            "OpenAlex Works"
+            if v == "openalex"
+            else "Scopus Search (AU-ID)"
+        ),
+        help=(
+            "OpenAlex: `filter=author.id:…`. Scopus: Elsevier `…/search/scopus?query=AU-ID(…)` "
+            "with your institutional token; open access fields come from Scopus."
+        ),
+    )
+    src = str(choice)
+    if src == "scopus" and not have_elsevier:
+        st.warning("Scopus Search requires both Elsevier **api key** and **insttoken**.")
+    elif src == "scopus":
+        st.caption(
+            "Uses Scopus **openaccess** / **freetoread** fields for OA columns. "
+            "SDG labels still use Aurora (no SDG field in Scopus search results). "
+            "Resolve a **numeric Scopus author ID**, or an OpenAlex author that includes a Scopus id."
+        )
+    return src
 
 
 def render_author_selector(
@@ -1607,6 +1657,7 @@ def main():
     institution_id: Optional[str] = None
     include_lineage = False
     author_openalex_id: Optional[str] = None
+    author_pub_source = "openalex"
     if query_mode == "institution":
         institution_id, include_lineage = render_institution_selector(user_agent)
     else:
@@ -1615,6 +1666,7 @@ def main():
             scopus_api_key=scopus_api_key,
             scopus_insttoken=scopus_insttoken,
         )
+        author_pub_source = render_author_publication_source_selector(scopus_api_key, scopus_insttoken)
     st.write("")
     publication_type = render_publication_type_selector()
     st.write("")
@@ -1669,6 +1721,7 @@ def main():
         "mode": query_mode,
         "institution": institution_id,
         "author": author_openalex_id,
+        "author_pub_source": author_pub_source,
         "type": publication_type,
         "model": model,
         "from": from_date_str,
@@ -1693,12 +1746,19 @@ def main():
     if not can_run_new_query and result_payload_gate:
         st.caption("Resolve an author or choose a valid institution to run a new query.")
 
+    scopus_source_blocked = (
+        query_mode == "author"
+        and author_pub_source == "scopus"
+        and not (scopus_api_key and (scopus_insttoken or "").strip())
+    )
     run_button_clicked = st.button(
         "Fetch works and build CSV",
         type="primary",
         key="main_fetch_button",
-        disabled=not can_run_new_query,
+        disabled=not can_run_new_query or scopus_source_blocked,
     )
+    if scopus_source_blocked:
+        st.caption("Scopus publication source is selected but Elsevier keys are missing—switch to **OpenAlex Works** or add credentials.")
     if run_button_clicked: # Renamed run_button to run_button_clicked
         st.session_state["fetch_params"] = current_params
         st.session_state["fetch_cancel_requested"] = False
@@ -1755,12 +1815,18 @@ def main():
             from_date_str,
             to_date_str,
             limit_rows,
+            list_source=str(current_params.get("author_pub_source") or "openalex"),
         )
 
         def cancel_check() -> bool:
             return bool(st.session_state.get("fetch_cancel_requested"))
 
-        with st.spinner("Contacting OpenAlex and Aurora APIs…"):
+        spinner_label = (
+            "Contacting Elsevier Scopus and Aurora APIs…"
+            if query_mode == "author" and author_pub_source == "scopus"
+            else "Contacting OpenAlex and Aurora APIs…"
+        )
+        with st.spinner(spinner_label):
             try:
                 if query_mode == "institution":
                     rows, stats = _call_fetch_works_with_sdg(
@@ -1776,6 +1842,24 @@ def main():
                         enable_google_scholar=google_scholar_enabled,
                         serpapi_api_key=serpapi_api_key, # Pass SerpApi key
                         extra_institution_ids=lineage_ids if include_lineage else None,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    )
+                elif author_pub_source == "scopus":
+                    author_raw = (st.session_state.get("author_identifier_input") or "").strip()
+                    rows, stats = fetch_author_publications_scopus_with_sdg(
+                        from_date_str,
+                        publication_type,
+                        model,
+                        author_openalex_id=author_openalex_id or "",
+                        author_raw_identifier=author_raw,
+                        to_date=to_date_str,
+                        limit_rows=limit_rows,
+                        user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
+                        scopus_api_key=scopus_api_key,
+                        scopus_insttoken=scopus_insttoken,
+                        enable_google_scholar=google_scholar_enabled,
+                        serpapi_api_key=serpapi_api_key,
                         progress_callback=progress_callback,
                         cancel_check=cancel_check,
                     )
@@ -1798,6 +1882,10 @@ def main():
             except FetchCancelled:
                 _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
                 st.info("Fetch cancelled.", icon="⏹️")
+                return
+            except ValueError as exc:
+                _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
+                st.error(str(exc))
                 return
             except requests.HTTPError as exc:
                 _reset_fetch_state(progress_bar, progress_text, progress_detail, cancel_button_placeholder) # Use new placeholder
@@ -1833,6 +1921,7 @@ def main():
     result_params: Dict[str, Any] = result_payload.get("params") or {}
     result_mode = str(result_params.get("mode", "institution"))
     result_institution_id: Optional[str] = result_params.get("institution")
+    result_author_pub_source = str(result_params.get("author_pub_source") or "openalex")
 
     gs_note = (
         f"; retrieved from Google Scholar: **{stats.gs_abstract_retrieved:,}**."
@@ -1895,6 +1984,8 @@ def main():
         preview_df = pd.DataFrame(preview_rows)
         if "authors" in preview_df.columns:
             preview_df["authors"] = preview_df["authors"].apply(abbreviate_authors)
+        if "citedby_count" in preview_df.columns:
+            preview_df["citedby_count"] = pd.to_numeric(preview_df["citedby_count"], errors="coerce")
         preview_df.insert(0, "#", range(start_index + 1, start_index + 1 + len(preview_df)))
         rows_in_page = len(preview_df)
         table_height = 980 if rows_in_page >= PREVIEW_PAGE_SIZE else max(200, rows_in_page * 35 + 120)
@@ -1905,16 +1996,33 @@ def main():
                     "#", help="Row number in this page", width="small"
                 )
             elif column == "openalex_id":
-                column_configs[column] = st.column_config.LinkColumn(
-                    "OpenAlex ID",
-                    help="Open the work in OpenAlex",
-                    display_text=r"(?:https?://openalex\.org/)?(.+)",
-                )
+                if result_author_pub_source == "scopus":
+                    column_configs[column] = st.column_config.LinkColumn(
+                        "Scopus / Elsevier record",
+                        help="Open the abstract record (Elsevier API or Scopus)",
+                        display_text=r"(?:https?://[^/]+/)?(.+)",
+                    )
+                else:
+                    column_configs[column] = st.column_config.LinkColumn(
+                        "OpenAlex ID",
+                        help="Open the work in OpenAlex",
+                        display_text=r"(?:https?://openalex\.org/)?(.+)",
+                    )
             elif column.lower() == "doi":
                 column_configs[column] = st.column_config.LinkColumn(
                     "DOI",
                     help="Open this DOI in a new tab",
                     display_text=r"(?:https?://(?:dx\.)?doi\.org/)?(.+)",
+                )
+            elif column == "citedby_count":
+                column_configs[column] = st.column_config.NumberColumn(
+                    "Citations (Scopus)",
+                    help=(
+                        "Scopus cited-by count from the search XML when the list source is Scopus; "
+                        "empty for OpenAlex-only runs. Counts Scopus-indexed citing documents "
+                        "(not adjusted to remove self-citations)."
+                    ),
+                    format="%d",
                 )
             else:
                 column_configs[column] = st.column_config.TextColumn(column.replace("_", " ").title())
