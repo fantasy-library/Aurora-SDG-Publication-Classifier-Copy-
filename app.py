@@ -545,11 +545,12 @@ def render_institution_network(
         return
 
     st.caption(
-        "Each **node** is an institution (from OpenAlex authorship affiliations). An **edge** means two "
-        "institutions appeared together on at least one publication in your result set—shared co-authorship "
-        "across institutions. **Link-strength** on a node sums edge weights to every partner (each weight is "
-        "how many papers list that pair); one paper with many institutions adds a lot to that sum, so it is "
-        "usually *not* the same as publication count—use the hover **publications in this view** figure for that."
+        "Each **node** is an institution (from affiliation metadata on each row: OpenAlex authorships, or "
+        "Scopus search ``<affiliation>`` blocks with stable synthetic ids). An **edge** means two institutions "
+        "appeared together on at least one publication. Scopus search often lists only a subset of affiliations "
+        "compared to a full author profile, so graphs can look sparser than OpenAlex for the same person. "
+        "**Link-strength** on a node sums edge weights to partners (not the same as publication count—see hover "
+        "**publications in this view**)."
     )
 
     deg_full: Dict[str, int] = {}

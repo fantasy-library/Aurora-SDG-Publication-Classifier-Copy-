@@ -11,6 +11,7 @@ try:
 except Exception:
     pass
 
+import hashlib
 import json
 import logging
 import re
@@ -961,6 +962,12 @@ def _scopus_entry_citedby_count(entry_el: ET.Element) -> Optional[int]:
 
 
 def _scopus_entry_affiliations_json(entry_el: ET.Element) -> Tuple[str, List[dict]]:
+    """
+    Affiliations from Scopus search ``entry`` XML (often a subset of all co-authors).
+
+    Each affiliation gets a stable synthetic ``id`` so downstream tools (e.g. co-affiliation graphs)
+    can link institutions; Scopus search does not supply ROR/OpenAlex institution ids here.
+    """
     names: List[str] = []
     affs: List[dict] = []
     for ch in list(entry_el):
@@ -979,7 +986,9 @@ def _scopus_entry_affiliations_json(entry_el: ET.Element) -> Tuple[str, List[dic
                 city = sub.text.strip()
         if nm:
             names.append(nm)
-            affs.append({"id": "", "name": nm, "country": country, "city": city})
+            key = f"{nm}|{country}|{city}".lower().encode("utf-8", errors="ignore")
+            aff_id = "scopus:" + hashlib.sha256(key).hexdigest()[:22]
+            affs.append({"id": aff_id, "name": nm, "country": country, "city": city})
     return "; ".join(names), affs
 
 
@@ -995,21 +1004,31 @@ def _scopus_entry_link_href(entry_el: ET.Element, ref: str) -> str:
     return ""
 
 
-def _scopus_entry_open_access(entry_el: ET.Element) -> Tuple[Optional[bool], str]:
-    """
-    Map Scopus search ``openaccess`` / ``openaccessFlag`` / ``freetoread*`` fields to
-    ``is_oa`` and a human-readable ``oa_status`` string (not OpenAlex's vocabulary).
-    """
-    flag_txt = _scopus_entry_first_text(entry_el, "openaccessFlag").lower()
-    oa_code = _scopus_entry_first_text(entry_el, "openaccess")
-    labels: List[str] = []
+def _scopus_collect_nested_values(entry_el: ET.Element, parent_tag_local: str) -> List[str]:
+    """Collect text of each ``<value>`` child under ``<freetoreadLabel>``-style parents (local tag match)."""
+    want = parent_tag_local.lower()
+    out: List[str] = []
     for ch in list(entry_el):
-        if _els_tag_local(ch.tag).lower() != "freetoreadlabel":
+        if _els_tag_local(ch.tag).lower() != want:
             continue
         for sub in list(ch):
             if _els_tag_local(sub.tag).lower() == "value" and (sub.text or "").strip():
-                labels.append(sub.text.strip())
-    label_str = "; ".join(labels) if labels else ""
+                out.append(sub.text.strip())
+    return out
+
+
+def _scopus_entry_open_access(entry_el: ET.Element) -> Tuple[Optional[bool], str]:
+    """
+    Map Scopus search open-access fields to ``is_oa`` and ``oa_status``.
+
+    ``oa_status`` follows the Scopus **freetoreadLabel** block: human-readable ``<value>`` strings
+    joined with `` | `` (e.g. ``All Open Access | Hybrid Gold``). If labels are absent, machine
+    ``freetoread`` values are used; only then do we fall back to ``openaccess`` / ``openaccessFlag``.
+    """
+    flag_txt = _scopus_entry_first_text(entry_el, "openaccessFlag").lower()
+    oa_code = _scopus_entry_first_text(entry_el, "openaccess")
+    freetoread_label_vals = _scopus_collect_nested_values(entry_el, "freetoreadlabel")
+    freetoread_code_vals = _scopus_collect_nested_values(entry_el, "freetoread")
 
     is_oa: Optional[bool] = None
     if flag_txt == "true":
@@ -1020,17 +1039,21 @@ def _scopus_entry_open_access(entry_el: ET.Element) -> Tuple[Optional[bool], str
         is_oa = True
     if is_oa is None and oa_code == "0":
         is_oa = False
-    if is_oa is None and labels:
+    if is_oa is None and (freetoread_label_vals or freetoread_code_vals):
         is_oa = True
 
-    parts: List[str] = []
-    if oa_code:
-        parts.append(f"openaccess={oa_code}")
-    if flag_txt:
-        parts.append(f"openaccessFlag={flag_txt}")
-    if label_str:
-        parts.append(label_str)
-    oa_status = " · ".join(parts) if parts else (label_str or "")
+    if freetoread_label_vals:
+        oa_status = " | ".join(freetoread_label_vals)
+    elif freetoread_code_vals:
+        oa_status = " | ".join(freetoread_code_vals)
+    else:
+        parts: List[str] = []
+        if oa_code:
+            parts.append(f"openaccess={oa_code}")
+        if flag_txt:
+            parts.append(f"openaccessFlag={flag_txt}")
+        oa_status = " · ".join(parts) if parts else ""
+
     return is_oa, oa_status
 
 
@@ -1187,6 +1210,9 @@ def fetch_author_publications_scopus_with_sdg(
                     openalex_id = dc_id or f"scopus:anonymous:{stats.total_processed}"
 
                 insts_str, inst_affiliations = _scopus_entry_affiliations_json(entry_el)
+                inst_ids_str = "; ".join(
+                    [a.get("id", "").strip() for a in inst_affiliations if (a.get("id") or "").strip()]
+                )
                 is_oa, oa_status = _scopus_entry_open_access(entry_el)
 
                 authors_preview = abbreviate_authors(authors_str)
@@ -1308,7 +1334,7 @@ def fetch_author_publications_scopus_with_sdg(
                     "citedby_count": citedby_count if citedby_count is not None else "",
                     "authors": authors_str,
                     "institutions": insts_str,
-                    "institution_ids": "",
+                    "institution_ids": inst_ids_str,
                     "institution_countries": "; ".join(
                         [a.get("country", "") for a in inst_affiliations if a.get("country")]
                     ),
