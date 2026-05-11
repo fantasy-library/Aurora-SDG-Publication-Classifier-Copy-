@@ -134,6 +134,8 @@ CSV_FIELDNAMES = [
     "sdg_note",
 ]
 RESULT_SESSION_KEY = "fetch_result"
+# Earliest month offered in Advanced options (OpenAlex dates; Scopus PUBYEAR uses the same window).
+ADVANCED_OPTIONS_EARLIEST_MONTH = date(1970, 1, 1)
 # Radio option labels (avoid format_func — incompatible with some Streamlit / widget-state combos).
 QUERY_TARGET_LABEL_INSTITUTION = "Institution (ROR / OpenAlex)"
 QUERY_TARGET_LABEL_AUTHOR = "Author (ORCID / OpenAlex / Scopus)"
@@ -1537,19 +1539,18 @@ def render_model_selector() -> str:
 def render_advanced_options(
     scopus_key_from_secret: Optional[str],
     scopus_insttoken_from_secret: Optional[str],
-    default_from_secret: Optional[str],
+    _default_from_secret: Optional[str],
 ) -> Tuple[str, str, Optional[int]]:
-    """Render additional filters (date range, record limit, info callouts)."""
+    """Render additional filters (date range, record limit, info callouts).
+
+    Third argument is kept for callers (legacy `advanced_options.default_from_date`); the month
+    slider always spans from ``ADVANCED_OPTIONS_EARLIEST_MONTH`` through the current month.
+    """
     st.subheader("4. Advanced options", divider="grey")
     today = datetime.today().date().replace(day=1)
-    start_str = default_from_secret or "2023-01-01"
-    try:
-        start_date = datetime.strptime(start_str, "%Y-%m-%d").date().replace(day=1)
-    except ValueError:
-        start_date = date(2023, 1, 1)
     months: List[date] = []
-    year = start_date.year
-    month = start_date.month
+    year = ADVANCED_OPTIONS_EARLIEST_MONTH.year
+    month = ADVANCED_OPTIONS_EARLIEST_MONTH.month
     while year < today.year or (year == today.year and month <= today.month):
         months.append(date(year, month, 1))
         month += 1
@@ -1560,6 +1561,10 @@ def render_advanced_options(
         months = [today]
     labels = [dt.strftime("%B %Y") for dt in months]
     desired_start = date(today.year - 2, 1, 1)
+    if desired_start < months[0]:
+        desired_start = months[0]
+    if desired_start > months[-1]:
+        desired_start = months[-1]
     start_default_date = next((m for m in months if m >= desired_start), months[-1])
     si_default = months.index(start_default_date)
     ei_default = len(months) - 1
@@ -1568,11 +1573,11 @@ def render_advanced_options(
     start_label_default = labels[min(si_default, max_ix)]
     end_label_default = labels[min(ei_default, max_ix)]
 
-    st.markdown("**Publication dates (OpenAlex filter)**")
+    st.markdown("**Publication dates (OpenAlex / Scopus window)**")
     st.caption(
-        "Use the **month-range line** to narrow which works OpenAlex returns, using each work’s "
-        "**publication_date** and the API filters `from_publication_date` / `to_publication_date` "
-        "(month starts as YYYY-MM-01). Drag left/right handles to set start and end months."
+        "Use the **month-range line** to set **from_publication_date** / **to_publication_date** (OpenAlex) "
+        "or the **PUBYEAR** window (Scopus AU-ID search). Months run **January 1970** through the current month "
+        "(YYYY-MM-01). Drag both handles. Historical coverage still depends on what each index actually holds."
     )
     default_range = (start_label_default, end_label_default)
     if "adv_period_range_labels" not in st.session_state:
