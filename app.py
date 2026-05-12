@@ -1239,16 +1239,38 @@ def render_author_publication_source_selector(
             "To enable **Scopus Search**, set non-empty **scopus_api_key** and **scopus_insttoken** "
             "in `.streamlit/secrets.toml` (or `SCOPUS_API_KEY` / `SCOPUS_INSTTOKEN` in `.env`)."
         )
+
+    icons_dir = Path(__file__).resolve().parent / "icons"
+    scopus_icon = icons_dir / "Icon_-_Scopus.png"
+    openalex_icon = icons_dir / "icon_openalex.png"
+    img_col_sc, img_col_oa = st.columns(2)
+    with img_col_sc:
+        if scopus_icon.is_file():
+            st.image(str(scopus_icon), width=52)
+        else:
+            st.caption("Scopus")
+    with img_col_oa:
+        if openalex_icon.is_file():
+            st.image(str(openalex_icon), width=52)
+        else:
+            st.caption("OpenAlex")
+
+    options: Tuple[str, ...] = ("scopus", "openalex")
+    if "_author_pub_data_source" not in st.session_state:
+        st.session_state["_author_pub_data_source"] = "scopus" if have_elsevier else "openalex"
+    cur = st.session_state.get("_author_pub_data_source")
+    if cur not in options:
+        st.session_state["_author_pub_data_source"] = "scopus" if have_elsevier else "openalex"
+
     choice = st.radio(
         "Author works API",
-        options=("openalex", "scopus"),
-        index=0,
+        options=options,
         horizontal=True,
         key="_author_pub_data_source",
         format_func=lambda v: (
-            "OpenAlex Works"
-            if v == "openalex"
-            else "Scopus Search (AU-ID)"
+            "Scopus Search (AU-ID)"
+            if v == "scopus"
+            else "OpenAlex Works"
         ),
         help=(
             "OpenAlex: Works API `filter=author.id:…`. Scopus: Search API `AU-ID(…)` to collect DOIs, "
@@ -1268,6 +1290,78 @@ def render_author_publication_source_selector(
     return src
 
 
+def _resolve_author_from_raw_into_session(
+    raw: str,
+    user_agent: str,
+    scopus_api_key: Optional[str],
+    scopus_insttoken: Optional[str],
+) -> Tuple[bool, str, str]:
+    """
+    Run the author resolver and mirror the **Resolve author** button session updates.
+
+    Returns ``(ok, err_tag, err_detail)``. On success ``err_tag`` and ``err_detail`` are ``""``.
+    ``err_tag`` is one of ``""``, ``"empty"``, ``"plain"``, ``"scopus_au"`` (Elsevier + Scopus id
+    but no OpenAlex match—``err_detail`` is technical Markdown for an expander).
+    """
+    _have_els = bool(scopus_api_key and (scopus_insttoken or "").strip())
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        st.session_state.pop("author_resolved_id", None)
+        st.session_state.pop("author_resolved_name", None)
+        st.session_state.pop("author_resolve_note", None)
+        st.session_state.pop("author_scopus_au_fallback", None)
+        return False, "empty", "Enter an ORCID, OpenAlex author URL, or Scopus author ID."
+
+    spinner_msg = (
+        "Scopus ID → Elsevier (ORCID), then OpenAlex if needed…"
+        if looks_like_scopus_author_id(trimmed) and scopus_api_key and (scopus_insttoken or "").strip()
+        else "Looking up author…"
+    )
+    with st.spinner(spinner_msg):
+        try:
+            aid, name, err, resolve_note = resolve_author_openalex_id(
+                trimmed,
+                user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
+                scopus_api_key=scopus_api_key,
+                scopus_insttoken=scopus_insttoken,
+            )
+        except requests.RequestException as exc:
+            aid, name, err, resolve_note = None, None, str(exc), None
+    if err:
+        st.session_state.pop("author_resolved_id", None)
+        st.session_state.pop("author_resolved_name", None)
+        st.session_state.pop("author_resolve_note", None)
+        if looks_like_scopus_author_id(trimmed) and _have_els:
+            st.session_state["author_scopus_au_fallback"] = trimmed
+            return False, "scopus_au", err
+        st.session_state.pop("author_scopus_au_fallback", None)
+        return False, "plain", err
+    st.session_state.pop("author_scopus_au_fallback", None)
+    st.session_state["author_resolved_id"] = aid
+    st.session_state["author_resolved_name"] = name or ""
+    st.session_state["author_resolve_note"] = resolve_note or ""
+    return True, "", ""
+
+
+def _show_author_resolution_failure(err_tag: str, err_detail: str) -> None:
+    """UI for a failed resolver run (shared by **Resolve author** and fetch-on-resolve)."""
+    if err_tag == "empty":
+        st.warning(err_detail)
+        return
+    if err_tag == "scopus_au":
+        st.warning(
+            "OpenAlex did not match this Scopus author ID (Elsevier had no ORCID and/or "
+            "OpenAlex has no `filter=scopus` author). **Scopus Search (AU-ID)** is different: "
+            "it queries the **works** search API `AU-ID(…)` and can still return publications. "
+            "Select **Scopus Search (AU-ID)** as publication list source, then **Fetch works**—"
+            "no OpenAlex author URL is required."
+        )
+        with st.expander("Technical detail from resolver"):
+            st.markdown(err_detail)
+        return
+    st.error(err_detail)
+
+
 def render_author_selector(
     user_agent: str,
     scopus_api_key: Optional[str] = None,
@@ -1280,13 +1374,18 @@ def render_author_selector(
     If that fails, you can still use **Scopus Search (AU-ID)** (works search)—that API does not require
     an OpenAlex author record.
 
+    **Fetch works and build CSV** (OpenAlex Works) calls the same resolver when the identifier field
+    is non-empty, so **Resolve author** is optional preview.
+
     Returns (author_openalex_token, display_name).
     """
     st.subheader("1. Author", divider="violet")
     _have_els = bool(scopus_api_key and (scopus_insttoken or "").strip())
     st.caption(
         "Paste an ORCID (URL or 0000-0001-2345-6789), an OpenAlex author URL "
-        "(https://openalex.org/A…), or a numeric Scopus author ID, then click **Resolve author**."
+        "(https://openalex.org/A…), or a numeric Scopus author ID. "
+        "**Fetch works and build CSV** resolves the author automatically when **OpenAlex Works** is selected. "
+        "Optional: **Resolve author** previews the mapping without fetching."
         + (
             " **Scopus IDs:** Elsevier reads ORCID from the Scopus author profile when present; "
             "otherwise OpenAlex `filter=scopus` is used. Same **scopus_api_key** / "
@@ -1314,55 +1413,22 @@ def render_author_selector(
             "`SCOPUS_INSTTOKEN` in `.env`. Restart Streamlit after saving. "
             "Empty strings are treated as missing."
         )
-    resolve_clicked = st.button("Resolve author", type="primary", key="resolve_author_btn")
+    resolve_clicked = st.button("Resolve author", type="secondary", key="resolve_author_btn")
     if resolve_clicked:
         raw = (st.session_state.get("author_identifier_input") or "").strip()
-        if not raw:
-            st.warning("Enter an ORCID, OpenAlex author URL, or Scopus author ID.")
-            st.session_state.pop("author_resolved_id", None)
-            st.session_state.pop("author_resolved_name", None)
-            st.session_state.pop("author_resolve_note", None)
-            st.session_state.pop("author_scopus_au_fallback", None)
+        ok, err_tag, err_detail = _resolve_author_from_raw_into_session(
+            raw,
+            user_agent=user_agent,
+            scopus_api_key=scopus_api_key,
+            scopus_insttoken=scopus_insttoken,
+        )
+        if ok:
+            aid = st.session_state.get("author_resolved_id")
+            raw_name = st.session_state.get("author_resolved_name") or ""
+            disp = raw_name.strip() if isinstance(raw_name, str) else ""
+            st.success(f"Resolved: **{disp or aid}** (`{aid}`)")
         else:
-            spinner_msg = (
-                "Scopus ID → Elsevier (ORCID), then OpenAlex if needed…"
-                if looks_like_scopus_author_id(raw) and scopus_api_key and (scopus_insttoken or "").strip()
-                else "Looking up author…"
-            )
-            with st.spinner(spinner_msg):
-                try:
-                    aid, name, err, resolve_note = resolve_author_openalex_id(
-                        raw,
-                        user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
-                        scopus_api_key=scopus_api_key,
-                        scopus_insttoken=scopus_insttoken,
-                    )
-                except requests.RequestException as exc:
-                    aid, name, err, resolve_note = None, None, str(exc), None
-            if err:
-                st.session_state.pop("author_resolved_id", None)
-                st.session_state.pop("author_resolved_name", None)
-                st.session_state.pop("author_resolve_note", None)
-                if looks_like_scopus_author_id(raw) and _have_els:
-                    st.session_state["author_scopus_au_fallback"] = raw.strip()
-                    st.warning(
-                        "OpenAlex did not match this Scopus author ID (Elsevier had no ORCID and/or "
-                        "OpenAlex has no `filter=scopus` author). **Scopus Search (AU-ID)** is different: "
-                        "it queries the **works** search API `AU-ID(…)` and can still return publications. "
-                        "Select **Scopus Search (AU-ID)** as publication list source, then **Fetch works**—"
-                        "no OpenAlex author URL is required."
-                    )
-                    with st.expander("Technical detail from resolver"):
-                        st.markdown(err)
-                else:
-                    st.session_state.pop("author_scopus_au_fallback", None)
-                    st.error(err)
-            else:
-                st.session_state.pop("author_scopus_au_fallback", None)
-                st.session_state["author_resolved_id"] = aid
-                st.session_state["author_resolved_name"] = name or ""
-                st.session_state["author_resolve_note"] = resolve_note or ""
-                st.success(f"Resolved: **{name or aid}** (`{aid}`)")
+            _show_author_resolution_failure(err_tag, err_detail)
 
     aid = st.session_state.get("author_resolved_id")
     raw_name = st.session_state.get("author_resolved_name")
@@ -1371,7 +1437,8 @@ def render_author_selector(
     if aid:
         st.info(
             f"Active author: **{display_name or aid}** (`{aid}`). "
-            "Resolve again if you change the identifier."
+            "With **OpenAlex Works**, **Fetch works** re-resolves whenever the text box above is not empty, "
+            "so identifier edits apply on the next fetch. **Resolve author** previews without fetching."
         )
         rn = st.session_state.get("author_resolve_note") or ""
         if isinstance(rn, str) and rn.strip():
@@ -1725,7 +1792,9 @@ def main():
     if query_mode == "author" and author_pub_source == "scopus":
         has_valid_author = bool(_els_ok and _scopus_au_numeric)
     elif query_mode == "author":
-        has_valid_author = bool(author_openalex_id)
+        # OpenAlex Works: allow **Fetch** once an identifier is entered (or a prior resolve is cached);
+        # resolution runs on fetch when the text box is non-empty.
+        has_valid_author = bool(author_openalex_id) or bool(_author_raw_input)
     else:
         has_valid_author = False
     can_run_new_query = has_valid_institution or has_valid_author
@@ -1749,11 +1818,16 @@ def main():
                 )
             elif author_pub_source == "scopus" and not _scopus_au_numeric:
                 st.info(
-                    "Enter a **numeric Scopus author ID** (AU-ID), or resolve an OpenAlex/ORCID author first "
-                    "if you switch to **OpenAlex Works**."
+                    "Enter a **numeric Scopus author ID** (AU-ID) for **Scopus Search**, "
+                    "or paste an ORCID / OpenAlex author URL for **OpenAlex Works** "
+                    "(**Fetch works** resolves the author automatically)."
                 )
             else:
-                st.info("Resolve an author with **Resolve author** to continue (required for **OpenAlex Works**).")
+                st.info(
+                    "For **OpenAlex Works**, paste an ORCID, OpenAlex author URL, or Scopus author ID, "
+                    "then click **Fetch works and build CSV**—the author is resolved automatically. "
+                    "Optional: **Resolve author** previews the match without fetching."
+                )
         return
 
     st.write("")
@@ -1796,7 +1870,7 @@ def main():
     cancel_button_placeholder = st.empty() # New placeholder for the cancel button
 
     if not can_run_new_query and result_payload_gate:
-        st.caption("Resolve an author or choose a valid institution to run a new query.")
+        st.caption("Enter an author identifier, resolve an author, or choose a valid institution to run a new query.")
 
     scopus_source_blocked = (
         query_mode == "author"
@@ -1811,11 +1885,36 @@ def main():
     )
     if scopus_source_blocked:
         st.caption("Scopus publication source is selected but Elsevier keys are missing—switch to **OpenAlex Works** or add credentials.")
-    if run_button_clicked: # Renamed run_button to run_button_clicked
-        st.session_state["fetch_params"] = current_params
+    if run_button_clicked:
+        fetch_params_to_store = dict(current_params)
+        if query_mode == "author" and author_pub_source == "openalex":
+            raw_fetch = (st.session_state.get("author_identifier_input") or "").strip()
+            if raw_fetch:
+                ok_res, err_tag, err_detail = _resolve_author_from_raw_into_session(
+                    raw_fetch,
+                    user_agent=user_agent,
+                    scopus_api_key=scopus_api_key,
+                    scopus_insttoken=scopus_insttoken,
+                )
+                if not ok_res:
+                    _show_author_resolution_failure(err_tag, err_detail)
+                    st.stop()
+                st.toast("Author resolved — starting fetch…", icon="🔍")
+            elif not author_openalex_id:
+                st.warning(
+                    "Enter an ORCID, OpenAlex author URL, or Scopus author ID before fetching, "
+                    "or use **Resolve author** after pasting an identifier."
+                )
+                st.stop()
+            aid_store = st.session_state.get("author_resolved_id")
+            if not isinstance(aid_store, str):
+                st.error("Author resolution did not return an OpenAlex author id.")
+                st.stop()
+            fetch_params_to_store["author"] = aid_store
+        st.session_state["fetch_params"] = fetch_params_to_store
         st.session_state["fetch_cancel_requested"] = False
         st.session_state["fetch_in_progress"] = True
-        st.rerun() # Trigger a rerun to enter the 'fetch_in_progress' block below
+        st.rerun()
 
     # This block handles rendering the cancel button and the actual fetch logic
     if st.session_state.get("fetch_in_progress"):
